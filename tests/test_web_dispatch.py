@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import re
 from types import SimpleNamespace
 
+import httpx
+from openai import AsyncOpenAI
 from fastapi.testclient import TestClient
 
+from pseudonymizer.app import create_app as create_pseudonymizer_app
 from web.app import OPENAI_INSTRUCTIONS, TIMEOUT_SECONDS, create_app
+from web.app import PseudonymizerClient
 
 
 class FakePseudonymizer:
@@ -134,3 +141,93 @@ def test_input_limit_and_missing_openai_configuration(monkeypatch):
     assert response.status_code == 503
     assert response.json()["error"]["stage"] == "configuration"
 
+
+def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    class PersonDetector:
+        def predict_entities(self, text, labels, threshold):
+            match = re.search(r"Alice Example", text)
+            if not match:
+                return []
+            return [{"text": match.group(), "label": "person name", "start": match.start(),
+                     "end": match.end(), "score": 0.99}]
+
+    async def scenario():
+        pseudo_app = create_pseudonymizer_app(detector=PersonDetector())
+        captured = []
+        sdk_errors = []
+        async with pseudo_app.router.lifespan_context(pseudo_app):
+            pseudo_http = httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=pseudo_app), base_url="http://pseudonymizer"
+            )
+            pseudo_client = PseudonymizerClient("http://pseudonymizer", client=pseudo_http)
+
+            async def openai_wire(request):
+                request_bytes = await request.aread()
+                request_body = json.loads(request_bytes)
+                captured.append({"path": request.url.path, **request_body})
+                assert "Alice Example" not in request_body["input"]
+                assert "alice@example.org" not in request_body["input"]
+                assert "opaque-map-id" not in request_bytes.decode("utf-8")
+                marker = re.search(r"⟦[^⟦⟧]+⟧", request_body["input"]).group()
+                response_body = {
+                    "id": "resp_synthetic", "object": "response", "created_at": 1,
+                    "status": "completed", "error": None, "incomplete_details": None,
+                    "instructions": request_body["instructions"], "max_output_tokens": None,
+                    "model": "gpt-4o-mini", "output": [{
+                        "id": "msg_synthetic", "type": "message", "status": "completed",
+                        "role": "assistant", "content": [{
+                            "type": "output_text", "text": f"Hello {marker}", "annotations": []
+                        }],
+                    }],
+                    "parallel_tool_calls": True, "temperature": 1.0, "tool_choice": "auto",
+                    "tools": [], "top_p": 1.0, "truncation": "disabled",
+                    "usage": {"input_tokens": 10, "input_tokens_details": {"cached_tokens": 0},
+                              "output_tokens": 3, "output_tokens_details": {"reasoning_tokens": 0},
+                              "total_tokens": 13}, "metadata": {},
+                }
+                return httpx.Response(200, json=response_body, request=request)
+
+            sdk_http = httpx.AsyncClient(transport=httpx.MockTransport(openai_wire))
+            sdk_client = AsyncOpenAI(api_key="synthetic-test-key", max_retries=0, http_client=sdk_http)
+            original_create = sdk_client.responses.create
+
+            async def traced_create(**kwargs):
+                try:
+                    return await original_create(**kwargs)
+                except Exception as exc:
+                    sdk_errors.append(f"{type(exc).__name__}: {exc}")
+                    raise
+
+            sdk_client.responses.create = traced_create
+            web_app = create_app(pseudonymizer=pseudo_client, openai_client=sdk_client)
+            async with web_app.router.lifespan_context(web_app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=web_app), base_url="http://web"
+                ) as browser:
+                    response = await browser.post("/api/process", json={
+                        "prompt": "Summarize for Alice Example", "document": "Alice Example: alice@example.org",
+                    })
+            await sdk_client.close()
+            await pseudo_http.aclose()
+        return response, sdk_errors
+
+    response, sdk_errors = asyncio.run(scenario())
+    assert response.status_code == 200, f"{response.text} SDK errors: {sdk_errors}"
+    body = response.json()
+    wire = captured[0]
+    assert wire["path"] == "/v1/responses"
+    assert wire["model"] == "gpt-4o-mini"
+    assert wire["store"] is False
+    assert "temperature" not in wire
+    assert "Alice Example" not in json.dumps(wire)
+    assert "alice@example.org" not in json.dumps(wire)
+    assert "mapping_id" not in wire
+    assert body["sent_request"] == {
+        "model": wire["model"], "instructions": wire["instructions"],
+        "input": wire["input"], "store": False,
+    }
+    assert body["received_text"].startswith("Hello ⟦PERSON_")
+    assert body["restored_text"] == "Hello Alice Example"

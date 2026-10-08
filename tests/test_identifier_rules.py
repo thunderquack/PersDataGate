@@ -1,4 +1,7 @@
-from pseudonymizer.service import anonymize_text
+from fastapi.testclient import TestClient
+
+from pseudonymizer.app import create_app
+from pseudonymizer.service import MappingStore, anonymize_text
 
 
 class NoEntities:
@@ -28,3 +31,20 @@ def test_phone_does_not_absorb_adjacent_date():
 
     assert "12.05.2024" in masked
     assert next(iter(mapping.values())) == "+49 30 123456"
+
+
+def test_deanonymize_accepts_large_openai_response_after_marker_expansion():
+    marker = "⟦PERSON_0123456789abcdef0123456789abcdef_1⟧"
+    store = MappingStore()
+    mapping_id, _ = store.create({marker: "I"})
+    masked_response = (marker + " ") * 2_000
+
+    with TestClient(create_app(detector=NoEntities(), store=store)) as client:
+        response = client.post(
+            "/deanonymize",
+            json={"mapping_id": mapping_id, "text": masked_response},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == ("I ") * 2_000
+    store.close()

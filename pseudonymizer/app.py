@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 
 from .service import MAX_TEXT_LENGTH, MappingStore, anonymize_text, expires_iso, restore_text
 
+MAX_RESPONSE_LENGTH = 3_000_000
+
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -20,7 +22,7 @@ class AnonymizeRequest(BaseModel):
 
 class DeanonymizeRequest(BaseModel):
     mapping_id: str
-    text: str = Field(max_length=MAX_TEXT_LENGTH)
+    text: str = Field(max_length=MAX_RESPONSE_LENGTH)
 
 
 class GLiNERDetector:

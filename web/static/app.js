@@ -15,6 +15,7 @@ $("process").addEventListener("click", async () => {
     const result = await response.json();
     if (result.sent_request) showRequest(result.sent_request);
     else if (result.prepared_text) setText("request", `Подготовленный псевдонимизированный текст:\n${result.prepared_text}`);
+    else setText("request", "Запрос в OpenAI не сформирован.", true);
     if (result.received_text) { receivedText = result.received_text; setText("received", receivedText); }
     if (result.restored_text !== undefined) { restoredText = result.restored_text; setText("restored", restoredText); }
     if (!response.ok) {
@@ -24,6 +25,7 @@ $("process").addEventListener("click", async () => {
     $("warnings").textContent = (result.warnings || []).join(" "); $("status").textContent = "Готово";
   } catch (error) {
     $("status").className = "error"; $("status").textContent = error.message || "Ошибка обработки.";
+    if (!sentRequest) setText("request", "Запрос в OpenAI не сформирован.", true);
     if (!receivedText) setText("received", "Ответ пока не получен.", true);
     if (!restoredText) setText("restored", "Ответ пока не восстановлен.", true);
   } finally { button.disabled = false; }

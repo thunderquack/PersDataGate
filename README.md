@@ -63,10 +63,20 @@ GLiNER ищет имена, адреса, даты рождения, номер�
 
 ## Тесты
 
+После сборки Web тесты можно запускать в одноразовом контейнере Python 3.11:
+
 ```powershell
-python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements-dev.txt
-.venv\Scripts\python -m pytest -q
+docker run --rm --mount "type=bind,source=$PWD,target=/checks" -w /checks persdatagate-web sh -c "python -m pip install -q -r requirements-dev.txt && python -m pytest -q"
 ```
 
+Для локального запуска используйте Python 3.11, виртуальное окружение и `requirements-dev.txt`.
+
 Unit/API-тесты используют подменённые детектор и OpenAI и не требуют Torch, GPU, ключа или платных API-вызовов. CUDA, реальная модель и качество распознавания проверяются отдельно внутри Docker.
+
+После готовности pseudonymizer выполните оценку на синтетических русских и немецких примерах:
+
+```powershell
+Get-Content -Raw -Encoding UTF8 scripts/evaluate_model.py | docker compose exec -T web python -
+```
+
+Скрипт сообщает точные и частичные совпадения, пропуски и лишние замены, отдельно проверяя обратное восстановление. Успешный exit code означает точный round trip, а не стопроцентное качество распознавания.

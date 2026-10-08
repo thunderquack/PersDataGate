@@ -58,16 +58,17 @@ def install_dependencies(requirements: Path, upgrade: bool = False) -> str:
     for line in lines:
         if INDEX_LINE.match(line):
             continue
-        match = TORCH_LINE.match(line)
-        if match:
-            # Keep pip's PyPI resolver pinned to the CUDA build just installed.
-            clean_lines.append(f"torch=={torch_version}")
-        else:
+        if not TORCH_LINE.match(line):
             clean_lines.append(line)
+    # Torch is already installed. Resolve its dependencies explicitly on PyPI
+    # without requesting the CUDA-only torch distribution from that index.
+    clean_lines.extend(importlib.metadata.requires("torch") or [])
 
     with tempfile.TemporaryDirectory(prefix="persdatagate-requirements-") as temp_dir:
         clean_requirements = Path(temp_dir) / "requirements.txt"
         clean_requirements.write_text("\n".join(clean_lines) + "\n", encoding="utf-8")
+        constraints = Path(temp_dir) / "constraints.txt"
+        constraints.write_text(f"torch=={torch_version}\n", encoding="utf-8")
         args = ["install", "--only-binary=:all:", "--index-url", PYPI_INDEX]
         recovered_wheels = Path(PIP_CACHE) / "recovered-wheels"
         if recovered_wheels.is_dir():
@@ -76,7 +77,7 @@ def install_dependencies(requirements: Path, upgrade: bool = False) -> str:
             args.extend(["--find-links", str(recovered_wheels)])
         if upgrade:
             args.append("--upgrade")
-        args.extend(["-r", str(clean_requirements)])
+        args.extend(["-r", str(clean_requirements), "-c", str(constraints)])
         _pip(*args)
 
     return torch_version

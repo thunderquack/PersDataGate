@@ -148,31 +148,38 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
 
     class PersonDetector:
         def predict_entities(self, text, labels, threshold):
-            match = re.search(r"Alice Example", text)
-            if not match:
-                return []
             return [{"text": match.group(), "label": "person name", "start": match.start(),
-                     "end": match.end(), "score": 0.99}]
+                     "end": match.end(), "score": 0.99}
+                    for match in re.finditer(r"Alice Example", text)]
 
     async def scenario():
         pseudo_app = create_pseudonymizer_app(detector=PersonDetector())
         captured = []
-        sdk_errors = []
+        wire_errors = []
         async with pseudo_app.router.lifespan_context(pseudo_app):
             pseudo_http = httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=pseudo_app), base_url="http://pseudonymizer"
             )
-            pseudo_client = PseudonymizerClient("http://pseudonymizer", client=pseudo_http)
+            mapping_ids = []
+
+            class RecordingPseudonymizerClient(PseudonymizerClient):
+                async def anonymize(self, text):
+                    result = await super().anonymize(text)
+                    mapping_ids.append(result["mapping_id"])
+                    return result
+
+            pseudo_client = RecordingPseudonymizerClient("http://pseudonymizer", client=pseudo_http)
 
             async def openai_wire(request):
-                request_bytes = await request.aread()
-                request_body = json.loads(request_bytes)
-                captured.append({"path": request.url.path, **request_body})
-                assert "Alice Example" not in request_body["input"]
-                assert "alice@example.org" not in request_body["input"]
-                assert "opaque-map-id" not in request_bytes.decode("utf-8")
-                marker = re.search(r"⟦[^⟦⟧]+⟧", request_body["input"]).group()
-                response_body = {
+                try:
+                    request_bytes = await request.aread()
+                    request_body = json.loads(request_bytes)
+                    captured.append({"path": request.url.path, **request_body})
+                    assert "Alice Example" not in request_body["input"]
+                    assert "alice@example.org" not in request_body["input"]
+                    assert "opaque-map-id" not in request_bytes.decode("utf-8")
+                    marker = re.search(r"⟦[^⟦⟧]+⟧", request_body["input"]).group()
+                    response_body = {
                     "id": "resp_synthetic", "object": "response", "created_at": 1,
                     "status": "completed", "error": None, "incomplete_details": None,
                     "instructions": request_body["instructions"], "max_output_tokens": None,
@@ -187,21 +194,14 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
                     "usage": {"input_tokens": 10, "input_tokens_details": {"cached_tokens": 0},
                               "output_tokens": 3, "output_tokens_details": {"reasoning_tokens": 0},
                               "total_tokens": 13}, "metadata": {},
-                }
-                return httpx.Response(200, json=response_body, request=request)
+                    }
+                    return httpx.Response(200, json=response_body, request=request)
+                except Exception as exc:
+                    wire_errors.append(f"{type(exc).__name__}: {exc}")
+                    raise
 
             sdk_http = httpx.AsyncClient(transport=httpx.MockTransport(openai_wire))
             sdk_client = AsyncOpenAI(api_key="synthetic-test-key", max_retries=0, http_client=sdk_http)
-            original_create = sdk_client.responses.create
-
-            async def traced_create(**kwargs):
-                try:
-                    return await original_create(**kwargs)
-                except Exception as exc:
-                    sdk_errors.append(f"{type(exc).__name__}: {exc}")
-                    raise
-
-            sdk_client.responses.create = traced_create
             web_app = create_app(pseudonymizer=pseudo_client, openai_client=sdk_client)
             async with web_app.router.lifespan_context(web_app):
                 async with httpx.AsyncClient(
@@ -212,10 +212,10 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
                     })
             await sdk_client.close()
             await pseudo_http.aclose()
-        return response, sdk_errors
+        return response, captured, mapping_ids, wire_errors
 
-    response, sdk_errors = asyncio.run(scenario())
-    assert response.status_code == 200, f"{response.text} SDK errors: {sdk_errors}"
+    response, captured, mapping_ids, wire_errors = asyncio.run(scenario())
+    assert response.status_code == 200, f"{response.text}; wire errors: {wire_errors}"
     body = response.json()
     wire = captured[0]
     assert wire["path"] == "/v1/responses"
@@ -225,6 +225,7 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
     assert "Alice Example" not in json.dumps(wire)
     assert "alice@example.org" not in json.dumps(wire)
     assert "mapping_id" not in wire
+    assert all(mapping_id not in json.dumps(wire) for mapping_id in mapping_ids)
     assert body["sent_request"] == {
         "model": wire["model"], "instructions": wire["instructions"],
         "input": wire["input"], "store": False,

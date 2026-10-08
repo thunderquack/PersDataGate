@@ -19,11 +19,57 @@ LABELS = [
 # Format based detectors have precedence over model spans.
 PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("EMAIL", re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?!\w)")),
-    ("IBAN", re.compile(r"(?<![A-Za-z0-9])(?:[A-Z]{2}\d{2}[ ]?(?:[A-Z0-9][ ]?){11,30})(?![A-Za-z0-9])", re.I)),
-    ("PHONE", re.compile(r"(?i)\b(?:phone|telefon|телефон)\s*[:№]?\s*(?P<value>(?:\+|00)?\d[\d ()/.-]{5,}\d)|(?<!\w)(?P<international>(?:\+|00)\d[\d ()/.-]{5,}\d)(?!\w)")),
+    ("IBAN", re.compile(r"(?<![A-Z0-9])(?P<value>[A-Z]{2}\d{2}(?: ?[A-Z0-9]){10,32})", re.I)),
+    ("PHONE", re.compile(r"(?i)\b(?:phone|telefon|телефон)\s*[:№]?\s*(?P<value>(?:\+|00)?\d[\d ()/.-]{5,}\d)|(?<!\w)(?P<international>\+\d[\d ()/.-]{5,}\d)(?!\w)")),
     ("PASSPORT", re.compile(r"(?i)\bpassport\s+(?:no\.?|number)\s+(?P<value>[\w-]{5,14})|\bпаспорт\s+(?:№|номер)\s*(?P<value_ru>[\w-]{5,14})|\bReisepassnummer\s*[:№]?\s*(?P<value_de>[\w-]{5,14})")),
     ("ID", re.compile(r"(?i)\b(?:id|identity|document)\s+(?:no\.?|number)\s+(?P<value>[\w-]{5,20})|\b(?:номер документа|идентификационный номер)\s+(?P<value_ru>[\w-]{5,20})|\b(?:Ausweisnummer|Dokumentennummer)\s*[:№]?\s*(?P<value_de>[\w-]{5,20})")),
 )
+IBAN_LENGTHS = {
+    "AL": 28, "AD": 24, "AT": 20, "AZ": 28, "BH": 22, "BY": 28,
+    "BE": 16, "BA": 20, "BR": 29, "BG": 22, "CR": 22, "HR": 21,
+    "CY": 28, "CZ": 24, "DK": 18, "DO": 28, "EE": 20, "FO": 18,
+    "FI": 18, "FR": 27, "GE": 22, "DE": 22, "GI": 23, "GR": 27,
+    "GL": 18, "GT": 28, "HU": 28, "IS": 26, "IQ": 23, "IE": 22,
+    "IL": 23, "IT": 27, "JO": 30, "KZ": 20, "KW": 30, "LV": 21,
+    "LB": 28, "LI": 21, "LT": 20, "LU": 20, "MK": 19, "MT": 31,
+    "MR": 27, "MU": 30, "MC": 27, "MD": 24, "ME": 22, "NL": 18,
+    "NO": 15, "PK": 24, "PS": 29, "PL": 28, "PT": 25, "QA": 29,
+    "RO": 24, "LC": 32, "SM": 27, "SA": 24, "RS": 22, "SC": 31,
+    "SK": 24, "SI": 19, "ES": 24, "SE": 24, "CH": 21, "TL": 23,
+    "TN": 24, "TR": 26, "UA": 29, "AE": 23, "GB": 22, "VA": 22,
+    "VG": 24,
+}
+
+
+def _valid_iban_prefix(candidate: str) -> int | None:
+    compact = "".join(candidate.split()).upper()
+    length = IBAN_LENGTHS.get(compact[:2])
+    if length is None or len(compact) < length:
+        return None
+    iban = compact[:length]
+    rearranged = iban[4:] + iban[:4]
+    remainder = 0
+    for char in rearranged:
+        digits = str(ord(char) - 55) if char.isalpha() else char
+        for digit in digits:
+            remainder = (remainder * 10 + int(digit)) % 97
+    return length if remainder == 1 else None
+
+
+def _iban_span(match: re.Match[str]) -> tuple[str, int, int] | None:
+    candidate = match.group("value")
+    compact_length = _valid_iban_prefix(candidate)
+    if compact_length is None:
+        return None
+    count = 0
+    end = 0
+    for end, char in enumerate(candidate, start=1):
+        if char.isalnum():
+            count += 1
+            if count == compact_length:
+                break
+    start = match.start("value")
+    return candidate[:end], start, start + end
 LABEL_CODES = {
     "person name": "PERSON", "person": "PERSON", "street address": "ADDRESS",
     "address": "ADDRESS", "date of birth": "DOB", "date of birth date": "DOB",
@@ -80,6 +126,11 @@ class MappingStore:
             with self._lock:
                 self._purge(self._clock())
 
+    def close(self) -> None:
+        self._stop.set()
+        if self._cleaner is not threading.current_thread():
+            self._cleaner.join(timeout=1)
+
 
 def _chunks(text: str, tokenizer: Any | None = None) -> list[tuple[int, str]]:
     if tokenizer is not None:
@@ -99,8 +150,8 @@ def _chunks(text: str, tokenizer: Any | None = None) -> list[tuple[int, str]]:
                     if token_end == len(offsets):
                         break
                 return chunks
-        except (KeyError, TypeError, ValueError, NotImplementedError):
-            pass
+        except (KeyError, TypeError, ValueError, NotImplementedError) as exc:
+            raise RuntimeError("Tokenizer failed to split input safely") from exc
     if len(text) <= CHUNK_SIZE:
         return [(0, text)]
     chunks: list[tuple[int, str]] = []
@@ -128,14 +179,36 @@ def find_spans(text: str, model: Any) -> list[Span]:
                 spans.append(Span(start + local_start, start + local_end, text[start + local_start : start + local_end], code, float(item.get("score", 0))))
     for code, pattern in PATTERNS:
         for match in pattern.finditer(text):
+            if code == "IBAN":
+                iban = _iban_span(match)
+                if iban is None:
+                    continue
+                value, start, end = iban
+                spans.append(Span(start, end, value, code, 1.0, True))
+                continue
             group = next((name for name, value in match.groupdict().items() if value is not None), None)
             value = match.group(group) if group else match.group()
             start, end = match.span(group) if group else match.span()
+            if code == "PHONE":
+                # A date immediately following a phone number can otherwise be
+                # absorbed by the permissive international-number separators.
+                date = re.search(r"\s+\d{1,2}[./]\d{1,2}[./]\d{4}\b", value)
+                if date:
+                    value = value[:date.start()].rstrip()
+                    end = start + len(value)
+                digits = sum(char.isdigit() for char in value)
+                if digits > 15 or digits < 7:
+                    continue
             spans.append(Span(start, end, value, code, 1.0, True))
 
     # Deduplicate overlapping-window matches, then resolve overlap by rule,
     # longer span, and confidence in that order.
-    candidates = list({(s.start, s.end, s.code): s for s in spans}.values())
+    unique: dict[tuple[int, int, str], Span] = {}
+    for span in spans:
+        key = (span.start, span.end, span.code)
+        if key not in unique or span.confidence > unique[key].confidence:
+            unique[key] = span
+    candidates = list(unique.values())
     candidates.sort(key=lambda s: (not s.rule, -(s.end - s.start), -s.confidence, s.start))
     selected: list[Span] = []
     for candidate in candidates:

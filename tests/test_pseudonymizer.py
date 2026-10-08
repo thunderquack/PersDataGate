@@ -25,7 +25,7 @@ def entity(text: str, label: str, in_text: str, score=0.9):
 
 def test_mapping_store_expires_at_creation_and_unknown_ids_return_none():
     now = [100.0]
-    store = MappingStore(ttl_seconds=30, clock=lambda: now[0])
+    store = MappingStore(ttl_seconds=30, clock=lambda: now[0], wall_clock=lambda: now[0])
     mapping_id, expires = store.create({"marker": "value"})
     assert expires == 130
     assert store.get(mapping_id) == {"marker": "value"}
@@ -34,11 +34,19 @@ def test_mapping_store_expires_at_creation_and_unknown_ids_return_none():
     now[0] = 130
     assert store.get(mapping_id) is None
     assert store.get("unknown") is None
+    store.close()
 
 
 def test_repeated_unicode_values_share_marker_and_restore_once():
     source = "Юлия Müller, email julia@example.org; снова Юлия Müller"
-    detector = FakeDetector({source: [entity("Юлия Müller", "person name", source)]})
+    first_start = source.index("Юлия Müller")
+    second_start = source.rindex("Юлия Müller")
+    detector = FakeDetector({source: [
+        {"text": "Юлия Müller", "label": "person name", "start": first_start,
+         "end": first_start + len("Юлия Müller"), "score": 0.9},
+        {"text": "Юлия Müller", "label": "person name", "start": second_start,
+         "end": second_start + len("Юлия Müller"), "score": 0.9},
+    ]})
     masked, mapping = anonymize_text(source, detector)
     marker = next(iter(mapping))
     assert masked.count(marker) == 2
@@ -79,6 +87,47 @@ def test_long_text_is_chunked_with_overlap_and_preserves_global_spans():
     assert masked.endswith("y" * 700)
 
 
+class FakeTokenizer:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.calls = 0
+
+    def __call__(self, text, **kwargs):
+        self.calls += 1
+        if self.fail:
+            raise ValueError("bad tokenizer offsets")
+        # One token per character makes the 250/300-token chunk boundaries
+        # deterministic without importing the GLiNER/PyTorch stack.
+        return {"offset_mapping": [(index, index + 1) for index in range(len(text))]}
+
+
+def test_tokenizer_controls_chunking_and_offsets_are_mapped_to_original_text():
+    source = "a" * 275 + " Иван Петров " + "b" * 650
+    tokenizer = FakeTokenizer()
+    chunk_start, chunk_end = 250, 550
+    selected_chunk = source[chunk_start:chunk_end]
+    detector = FakeDetector({selected_chunk: [entity("Иван Петров", "person name", selected_chunk)]})
+    detector.tokenizer = tokenizer
+    masked, mapping = anonymize_text(source, detector)
+    assert tokenizer.calls == 1
+    assert len(detector.calls) > 1
+    assert "Иван Петров" not in masked
+    assert next(iter(mapping.values())) == "Иван Петров"
+
+
+def test_tokenizer_failure_fails_closed_at_api_boundary():
+    class BrokenDetector:
+        tokenizer = FakeTokenizer(fail=True)
+
+        def predict_entities(self, text, labels, threshold):
+            raise AssertionError("must not infer after tokenizer failure")
+
+    with TestClient(create_app(detector=BrokenDetector())) as client:
+        response = client.post("/anonymize", json={"text": "raw private data"})
+    assert response.status_code == 503
+    assert response.json()["detail"] == "anonymization_failed"
+
+
 def test_api_round_trip_ttl_and_mapping_isolation():
     clock = [10.0]
     store = MappingStore(ttl_seconds=5, clock=lambda: clock[0])
@@ -102,3 +151,4 @@ def test_api_round_trip_ttl_and_mapping_isolation():
         assert expired.status_code == 404
         unknown = client.post("/deanonymize", json={"mapping_id": "missing", "text": "hello"})
         assert unknown.status_code == 404
+    store.close()

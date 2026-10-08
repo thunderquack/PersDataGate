@@ -24,12 +24,14 @@ class DeanonymizeRequest(BaseModel):
 
 
 class GLiNERDetector:
-    def __init__(self, model: Any):
+    def __init__(self, model: Any, inference_mode: Any):
         self.model = model
+        self.tokenizer = model.data_processor.transformer_tokenizer
         self.lock = threading.Lock()
+        self.inference_mode = inference_mode
 
     def predict_entities(self, *args: Any, **kwargs: Any) -> Any:
-        with self.lock:
+        with self.lock, self.inference_mode():
             return self.model.predict_entities(*args, **kwargs)
 
 
@@ -52,7 +54,9 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None) -
                     cache_dir=os.getenv("HF_HOME", "/models/huggingface"),
                 )
                 model.to("cuda")
-                app.state.detector = GLiNERDetector(model)
+                model.eval()
+                import torch
+                app.state.detector = GLiNERDetector(model, torch.inference_mode)
             except Exception as exc:
                 logger.error("GLiNER startup failed (%s)", type(exc).__name__)
                 raise RuntimeError(f"Could not initialize CUDA GLiNER: {exc}") from exc
@@ -61,6 +65,9 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None) -
         app.state.ready = True
         yield
         app.state.ready = False
+        close = getattr(app.state.store, "close", None)
+        if close:
+            close()
 
     app = FastAPI(title="PersDataGate Pseudonymizer", lifespan=lifespan)
 

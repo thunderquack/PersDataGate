@@ -1,0 +1,30 @@
+[
+  {
+    "id": "ru_basic",
+    "language": "ru",
+    "text": "Заявитель Анна Смирнова, дата рождения 14.03.1985, проживает по адресу: г. Казань, ул. Лесная, д. 12. Телефон +7 912 345-67-89, почта anna.smirnova@example.org. План 01.09.2025 утвердило Министерство примеров в Казани.",
+    "expected": ["Анна Смирнова", "14.03.1985", "г. Казань, ул. Лесная, д. 12", "+7 912 345-67-89", "anna.smirnova@example.org"],
+    "expected_retained": ["01.09.2025", "Министерство примеров", "Казань"]
+  },
+  {
+    "id": "de_basic",
+    "language": "de",
+    "text": "Antragstellerin Anna Müller, geboren am 14.03.1985, wohnhaft in Lindenstraße 12, 10115 Berlin. Telefon +49 30 12345678, E-Mail anna.mueller@example.org. Der Plan vom 01.09.2025 wurde vom Beispielministerium in Berlin beschlossen.",
+    "expected": ["Anna Müller", "14.03.1985", "Lindenstraße 12, 10115 Berlin", "+49 30 12345678", "anna.mueller@example.org"],
+    "expected_retained": ["01.09.2025", "Beispielministerium", "Berlin"]
+  },
+  {
+    "id": "ru_financial_and_document_ids",
+    "language": "ru",
+    "text": "Письмо от ООО Ромашка, Москва, от 01.09.2025. Паспорт № 4510-123456, IBAN DE89 3704 0044 0532 0130 00.",
+    "expected": ["4510-123456", "DE89 3704 0044 0532 0130 00"],
+    "expected_retained": ["01.09.2025", "ООО Ромашка", "Москва"]
+  },
+  {
+    "id": "de_financial_and_document_ids",
+    "language": "de",
+    "text": "Schreiben der Beispiel GmbH aus Berlin vom 01.09.2025. Passport number AB1234567, IBAN DE89 3704 0044 0532 0130 00.",
+    "expected": ["AB1234567", "DE89 3704 0044 0532 0130 00"],
+    "expected_retained": ["01.09.2025", "Beispiel GmbH", "Berlin"]
+  }
+]

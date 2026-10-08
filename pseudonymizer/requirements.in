@@ -1,5 +1,4 @@
 # Update within the current Python 3.11 / CUDA 12.8 compatibility line.
---extra-index-url https://download.pytorch.org/whl/cu128
 fastapi>=0.115.12,<1
 uvicorn[standard]>=0.34.2,<1
 pydantic>=2.11.4,<3

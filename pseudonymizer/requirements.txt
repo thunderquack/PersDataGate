@@ -1,0 +1,9 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pydantic==2.11.4
+gliner==0.2.21
+transformers==4.51.3
+huggingface-hub==0.30.2
+tokenizers==0.21.1
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1

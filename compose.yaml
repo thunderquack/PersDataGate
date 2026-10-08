@@ -1,0 +1,42 @@
+name: persdatagate
+
+services:
+  pseudonymizer:
+    build:
+      context: .
+      dockerfile: pseudonymizer/Dockerfile
+    gpus: all
+    environment:
+      HF_HOME: /models/huggingface
+    volumes:
+      - model-cache:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      retries: 4
+      start_period: 15m
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:8000"
+    environment:
+      PSEUDONYMIZER_URL: http://pseudonymizer:8000
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+    depends_on:
+      pseudonymizer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      retries: 4
+    restart: unless-stopped
+
+volumes:
+  model-cache:

@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import logging
+import os
+import threading
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from .service import MAX_TEXT_LENGTH, MappingStore, anonymize_text, expires_iso, restore_text
+
+logger = logging.getLogger("uvicorn.error")
+
+
+class AnonymizeRequest(BaseModel):
+    text: str = Field(max_length=MAX_TEXT_LENGTH)
+
+
+class DeanonymizeRequest(BaseModel):
+    mapping_id: str
+    text: str = Field(max_length=MAX_TEXT_LENGTH)
+
+
+class GLiNERDetector:
+    def __init__(self, model: Any):
+        self.model = model
+        self.lock = threading.Lock()
+
+    def predict_entities(self, *args: Any, **kwargs: Any) -> Any:
+        with self.lock:
+            return self.model.predict_entities(*args, **kwargs)
+
+
+def create_app(detector: Any | None = None, store: MappingStore | None = None) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if detector is not None:
+            app.state.detector = detector
+        else:
+            try:
+                import torch
+                from gliner import GLiNER
+
+                if not torch.cuda.is_available():
+                    raise RuntimeError("CUDA GPU is required but torch.cuda.is_available() is false")
+                model = GLiNER.from_pretrained(
+                    os.getenv("GLINER_MODEL", "urchade/gliner_multi-v2.1"),
+                    revision=os.getenv("GLINER_REVISION", "443d26d654e0324125a96bebd8e796c14ff2efe6"),
+                    max_length=384,
+                    cache_dir=os.getenv("HF_HOME", "/models/huggingface"),
+                )
+                model.to("cuda")
+                app.state.detector = GLiNERDetector(model)
+            except Exception as exc:
+                logger.error("GLiNER startup failed (%s)", type(exc).__name__)
+                raise RuntimeError(f"Could not initialize CUDA GLiNER: {exc}") from exc
+        app.state.store = store or MappingStore()
+        app.state.ready = True
+        yield
+        app.state.ready = False
+
+    app = FastAPI(title="PersDataGate Pseudonymizer", lifespan=lifespan)
+
+    @app.get("/health/ready")
+    async def readiness() -> dict[str, bool]:
+        if not getattr(app.state, "ready", False):
+            raise HTTPException(status_code=503, detail="model_not_ready")
+        return {"ready": True}
+
+    @app.post("/anonymize")
+    def anonymize(request: AnonymizeRequest) -> dict[str, str]:
+        if not getattr(app.state, "ready", False):
+            raise HTTPException(status_code=503, detail="model_not_ready")
+        try:
+            safe_text, mapping = anonymize_text(request.text, app.state.detector)
+        except Exception as exc:
+            logger.error("Anonymization failed (%s)", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="anonymization_failed") from exc
+        mapping_id, expiration = app.state.store.create(mapping)
+        return {"mapping_id": mapping_id, "text": safe_text, "expires_at": expires_iso(expiration)}
+
+    @app.post("/deanonymize")
+    async def deanonymize(request: DeanonymizeRequest) -> dict[str, Any]:
+        mapping = app.state.store.get(request.mapping_id)
+        if mapping is None:
+            raise HTTPException(status_code=404, detail="mapping_not_found")
+        text, warnings = restore_text(request.text, mapping)
+        return {"text": text, "warnings": warnings}
+
+    return app
+
+
+app = create_app()

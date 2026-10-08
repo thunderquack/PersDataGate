@@ -8,7 +8,14 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from openai import AsyncOpenAI
+from openai import (
+    APITimeoutError,
+    AsyncOpenAI,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    RateLimitError,
+)
 from pydantic import BaseModel, Field
 
 MAX_INPUT_CHARS = 50_000
@@ -121,12 +128,39 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
                 timeout=TIMEOUT_SECONDS,
             )
             received = result.output_text
+        except AuthenticationError:
+            raise ApiError("openai", "openai_authentication_failed",
+                           "OpenAI отклонил ключ API. Проверьте OPENAI_API_KEY.",
+                           prepared=prepared, sent_request=sent_request) from None
+        except NotFoundError:
+            raise ApiError("openai", "openai_model_not_found",
+                           "OpenAI не нашёл указанную модель. Проверьте OPENAI_MODEL.",
+                           prepared=prepared, sent_request=sent_request) from None
+        except BadRequestError:
+            raise ApiError("openai", "openai_request_rejected",
+                           "OpenAI отклонил запрос. Проверьте модель и параметры.",
+                           prepared=prepared, sent_request=sent_request) from None
+        except APITimeoutError:
+            raise ApiError("openai", "openai_timeout", "OpenAI не ответил за отведённое время.",
+                           prepared=prepared, sent_request=sent_request) from None
+        except RateLimitError:
+            raise ApiError("openai", "openai_rate_limited",
+                           "Превышен лимит запросов или квота OpenAI. Проверьте проект API и повторите попытку позже.",
+                           prepared=prepared, sent_request=sent_request) from None
         except Exception:
             raise ApiError("openai", "openai_request_failed", "Не удалось получить ответ OpenAI.",
                            prepared=prepared, sent_request=sent_request) from None
         try:
             restored = await request.app.state.pseudonymizer.deanonymize(mapping_id, received)
             restored_text, warnings = restored["text"], restored.get("warnings", [])
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise ApiError("deanonymize", "mapping_not_found",
+                               "Таблица замен истекла или потеряна после перезапуска сервиса.",
+                               prepared=prepared, received=received, sent_request=sent_request) from None
+            raise ApiError("deanonymize", "deanonymization_failed",
+                           "Ответ получен, но восстановить исходные значения не удалось.",
+                           prepared=prepared, received=received, sent_request=sent_request) from None
         except Exception:
             raise ApiError("deanonymize", "deanonymization_failed",
                            "Ответ получен, но восстановить исходные значения не удалось.",

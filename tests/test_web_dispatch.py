@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import httpx
 from openai import AsyncOpenAI
 from fastapi.testclient import TestClient
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from pseudonymizer.app import create_app as create_pseudonymizer_app
 from web.app import OPENAI_INSTRUCTIONS, TIMEOUT_SECONDS, create_app
@@ -122,6 +124,92 @@ def test_restore_failure_keeps_both_masked_request_and_received_answer(monkeypat
     assert body["error"]["stage"] == "deanonymize"
     assert body["prepared_text"] == "[masked document]"
     assert body["received_text"] == "answer containing marker"
+
+
+def test_downstream_mapping_404_preserves_received_and_sent_text(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+
+    async def scenario():
+        pseudonymizer_api = FastAPI()
+
+        @pseudonymizer_api.post("/anonymize")
+        async def anonymize(_body: dict):
+            return {"mapping_id": "expired-map", "text": "[masked]"}
+
+        @pseudonymizer_api.post("/deanonymize")
+        async def deanonymize(_body: dict):
+            return JSONResponse(status_code=404, content={"detail": "mapping_not_found"})
+
+        pseudo_http = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=pseudonymizer_api), base_url="http://pseudonymizer"
+        )
+        pseudo_client = PseudonymizerClient("http://pseudonymizer", client=pseudo_http)
+        web_app = create_app(
+            pseudonymizer=pseudo_client,
+            openai_client=FakeOpenAI(output_text="[received answer]"),
+        )
+        async with web_app.router.lifespan_context(web_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=web_app), base_url="http://web"
+            ) as browser:
+                response = await browser.post("/api/process", json={"prompt": "p", "document": "private source"})
+        await pseudo_http.aclose()
+        return response
+
+    response = asyncio.run(scenario())
+    assert response.status_code == 502
+    body = response.json()
+    assert body["error"] == {
+        "stage": "deanonymize", "code": "mapping_not_found",
+        "message": "Таблица замен истекла или потеряна после перезапуска сервиса.",
+    }
+    assert body["prepared_text"] == "[masked]"
+    assert body["received_text"] == "[received answer]"
+    assert body["sent_request"] == {
+        "model": "test-model", "instructions": OPENAI_INSTRUCTIONS,
+        "input": "[masked]", "store": False,
+    }
+    assert "private source" not in response.text
+
+
+def test_actual_sdk_auth_401_returns_safe_message_without_upstream_error_or_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-secret-key")
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+
+    async def scenario():
+        async def unauthorized(request):
+            await request.aread()
+            return httpx.Response(401, json={"error": {
+                "message": "Incorrect API key provided: sk-test-private-value",
+                "type": "invalid_request_error", "param": None, "code": "invalid_api_key",
+            }}, request=request)
+
+        sdk_http = httpx.AsyncClient(transport=httpx.MockTransport(unauthorized))
+        sdk_client = AsyncOpenAI(
+            api_key="synthetic-secret-key", max_retries=0, http_client=sdk_http
+        )
+        web_app = create_app(pseudonymizer=FakePseudonymizer(), openai_client=sdk_client)
+        async with web_app.router.lifespan_context(web_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=web_app), base_url="http://web"
+            ) as browser:
+                response = await browser.post("/api/process", json={"prompt": "p", "document": "private source"})
+        await sdk_client.close()
+        return response
+
+    response = asyncio.run(scenario())
+    assert response.status_code == 502
+    body = response.json()
+    assert body["error"]["stage"] == "openai"
+    assert body["error"]["code"] == "openai_authentication_failed"
+    assert body["prepared_text"] == "[masked document]"
+    assert body["received_text"] == ""
+    assert body["sent_request"]["input"] == "[masked document]"
+    assert "synthetic-secret-key" not in response.text
+    assert "sk-test-private-value" not in response.text
+    assert "Incorrect API key provided" not in response.text
+    assert "private source" not in response.text
 
 
 def test_input_limit_and_missing_openai_configuration(monkeypatch):

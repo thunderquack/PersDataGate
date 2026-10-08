@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 from .service import MAX_TEXT_LENGTH, MappingStore, anonymize_text, expires_iso, restore_text
 
 MAX_RESPONSE_LENGTH = 3_000_000
+GLINER_MODEL_ID = "urchade/gliner_multi-v2.1"
+GLINER_REVISION = "443d26d654e0324125a96bebd8e796c14ff2efe6"
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -46,18 +48,24 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None) -
             try:
                 import torch
                 from gliner import GLiNER
+                from huggingface_hub import snapshot_download
 
                 if not torch.cuda.is_available():
                     raise RuntimeError("CUDA GPU is required but torch.cuda.is_available() is false")
+                cache_dir = os.getenv("HF_HOME", "/models/huggingface")
+                model_snapshot = snapshot_download(
+                    repo_id=GLINER_MODEL_ID,
+                    revision=GLINER_REVISION,
+                    cache_dir=cache_dir,
+                    allow_patterns=["gliner_config.json", "model.safetensors"],
+                )
                 model = GLiNER.from_pretrained(
-                    os.getenv("GLINER_MODEL", "urchade/gliner_multi-v2.1"),
-                    revision=os.getenv("GLINER_REVISION", "443d26d654e0324125a96bebd8e796c14ff2efe6"),
+                    model_snapshot,
                     max_length=384,
-                    cache_dir=os.getenv("HF_HOME", "/models/huggingface"),
+                    cache_dir=cache_dir,
                 )
                 model.to("cuda")
                 model.eval()
-                import torch
                 app.state.detector = GLiNERDetector(model, torch.inference_mode)
             except Exception as exc:
                 logger.error("GLiNER startup failed (%s)", type(exc).__name__)

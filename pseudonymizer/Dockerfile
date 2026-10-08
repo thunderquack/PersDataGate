@@ -7,6 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY pseudonymizer/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir hf-xet==1.3.0
 COPY pseudonymizer /app/pseudonymizer
 
 EXPOSE 8000

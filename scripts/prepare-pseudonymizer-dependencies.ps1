@@ -17,20 +17,25 @@ New-Item -ItemType Directory -Force -Path $depsDir | Out-Null
 Push-Location $repoRoot
 try {
 
-$getImageFingerprint = {
+$getImageInfo = {
+    $id = docker image inspect --format '{{.Id}}' $image 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
     $label = docker image inspect --format '{{ index .Config.Labels "org.persdatagate.dependencies-fingerprint" }}' $image 2>$null
     if ($LASTEXITCODE -ne 0) { return $null }
-    return [string]$label
+    return [pscustomobject]@{ Id = [string]$id; Fingerprint = [string]$label }
 }
 
-$imageFingerprint = & $getImageFingerprint
-$imagePresent = $null -ne $imageFingerprint
+$imageInfo = & $getImageInfo
+$imagePresent = $null -ne $imageInfo
 
 if (-not $imagePresent -and (Test-Path -LiteralPath $archive)) {
     if (-not (Test-Path -LiteralPath $manifest)) {
         throw "Dependency archive has no manifest. Preserve it and restore the tagged image manually, or remove the archive before preparing dependencies."
     }
     $savedManifest = Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json
+    if ($savedManifest.image -ne $image) {
+        throw 'Saved dependency manifest names an unexpected Docker image tag.'
+    }
     if ($savedManifest.fingerprint -ne $fingerprint) {
         throw 'Saved dependency archive is stale for the current pinned requirements or dependency Dockerfile. Bump the dependency image version.'
     }
@@ -41,20 +46,34 @@ if (-not $imagePresent -and (Test-Path -LiteralPath $archive)) {
     Write-Host "Loading saved dependency image from $archive"
     docker load --input $archive
     if ($LASTEXITCODE -ne 0) { throw 'Could not load the saved dependency image.' }
-    $imageFingerprint = & $getImageFingerprint
-    $imagePresent = $null -ne $imageFingerprint
+    $imageInfo = & $getImageInfo
+    $imagePresent = $null -ne $imageInfo
+    if (-not $imagePresent -or $imageInfo.Id -ne $savedManifest.image_id) {
+        throw 'Loaded dependency archive did not restore the expected tagged image.'
+    }
+    if ($imageInfo.Fingerprint -ne $fingerprint) {
+        throw 'Loaded dependency image fingerprint does not match current pinned inputs.'
+    }
 }
 
-if ($imagePresent -and $imageFingerprint -ne $fingerprint) {
+if ($imagePresent -and $imageInfo.Fingerprint -ne $fingerprint) {
     throw 'The tagged dependency image is stale for the current pinned requirements or dependency Dockerfile. Bump the dependency image version.'
+}
+if ($imagePresent -and (Test-Path -LiteralPath $manifest)) {
+    $savedManifest = Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json
+    if ($savedManifest.fingerprint -ne $fingerprint -or $savedManifest.image -ne $image -or $savedManifest.image_id -ne $imageInfo.Id) {
+        throw 'The tagged dependency image does not match its manifest or current pinned inputs. Bump the dependency image version.'
+    }
 }
 
 if (-not $imagePresent) {
     Write-Host 'Building the pinned pseudonymizer dependency image. This downloads CUDA wheels once.'
     docker build --file pseudonymizer/Dockerfile.dependencies --build-arg "DEPS_FINGERPRINT=$fingerprint" --tag $image .
     if ($LASTEXITCODE -ne 0) { throw 'Could not build the dependency image.' }
-    $imageFingerprint = & $getImageFingerprint
-    if ($imageFingerprint -ne $fingerprint) { throw 'Built dependency image is missing the expected fingerprint label.' }
+    $imageInfo = & $getImageInfo
+    if (-not $imageInfo -or $imageInfo.Fingerprint -ne $fingerprint) {
+        throw 'Built dependency image is missing the expected fingerprint label.'
+    }
 }
 
 if (-not (Test-Path -LiteralPath $archive) -or -not (Test-Path -LiteralPath $manifest)) {
@@ -63,9 +82,12 @@ if (-not (Test-Path -LiteralPath $archive) -or -not (Test-Path -LiteralPath $man
     docker save --output $partialArchive $image
     if ($LASTEXITCODE -ne 0) { throw 'Could not save the dependency image archive.' }
     $partialHash = (Get-FileHash -LiteralPath $partialArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+    $imageInfo = & $getImageInfo
+    if (-not $imageInfo) { throw 'Dependency image disappeared before its archive was committed.' }
     Move-Item -Force -LiteralPath $partialArchive -Destination $archive
     $manifestData = [ordered]@{
         image = $image
+        image_id = $imageInfo.Id
         fingerprint = $fingerprint
         requirements_sha256 = $requirementsHash
         dockerfile_sha256 = $dockerfileHash

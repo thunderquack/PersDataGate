@@ -76,6 +76,9 @@ LABEL_CODES = {
     "passport number": "PASSPORT", "identity document number": "ID",
     "bank account number": "BANK_ACCOUNT", "email": "EMAIL", "phone number": "PHONE",
 }
+_ADDRESS_CONTEXT = re.compile(r"(?i)\b(?:по\s+адресу|адрес(?:а|е|у)?|wohnhaft\s+in|adresse|address)\s*:?\s*")
+_CITY_PREFIX = re.compile(r"(?i)(?:г\.?\s+[A-ZА-ЯЁ][\w-]*,\s*)$")
+_POSTCODE_CITY_SUFFIX = re.compile(r"(?i)(?:,\s*|\s+)\d{5}\s+[A-ZÄÖÜ][\wÄÖÜäöüß-]*")
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,31 @@ class Span:
     code: str
     confidence: float
     rule: bool = False
+
+
+def _expand_contextual_address(text: str, span: Span) -> Span:
+    """Include a nearby city/postcode only inside an explicit address phrase."""
+    if span.code != "ADDRESS":
+        return span
+    before_start = max(0, span.start - 120)
+    before = text[before_start : span.start]
+    contexts = list(_ADDRESS_CONTEXT.finditer(before))
+    if not contexts:
+        return span
+    context_end = contexts[-1].end()
+    context_tail = re.sub(r"(?i)\bг\.", "г", before[context_end:])
+    if re.search(r"[.!?;\n]", context_tail):
+        return span
+
+    start = span.start
+    city_prefix = _CITY_PREFIX.search(before)
+    if city_prefix:
+        start = before_start + city_prefix.start()
+    end = span.end
+    city_suffix = _POSTCODE_CITY_SUFFIX.match(text[end:])
+    if city_suffix:
+        end += city_suffix.end()
+    return Span(start, end, text[start:end], span.code, span.confidence, span.rule)
 
 
 class MappingStore:
@@ -176,7 +204,12 @@ def find_spans(text: str, model: Any) -> list[Span]:
                 continue
             code = LABEL_CODES.get(str(item.get("label", "")).lower())
             if code and 0 <= local_start < local_end <= len(chunk):
-                spans.append(Span(start + local_start, start + local_end, text[start + local_start : start + local_end], code, float(item.get("score", 0))))
+                entity_start, entity_end = start + local_start, start + local_end
+                entity_text = text[entity_start:entity_end]
+                if entity_text.strip().casefold() in LABEL_CODES:
+                    continue
+                span = Span(entity_start, entity_end, entity_text, code, float(item.get("score", 0)))
+                spans.append(_expand_contextual_address(text, span))
     for code, pattern in PATTERNS:
         for match in pattern.finditer(text):
             if code == "IBAN":

@@ -48,3 +48,41 @@ def test_deanonymize_accepts_large_openai_response_after_marker_expansion():
     assert response.status_code == 200
     assert response.json()["text"] == ("I ") * 2_000
     store.close()
+
+
+def test_model_label_phrase_is_not_treated_as_private_data():
+    source = "Schreiben: Passport number AB1234567"
+    start = source.index("Passport number")
+    end = source.index("AB1234567")
+
+    class LabelEcho:
+        def predict_entities(self, text, labels, threshold):
+            return [{"text": "Passport number", "label": "person name",
+                     "start": start, "end": end, "score": 0.99}]
+
+    masked, mapping = anonymize_text(source, LabelEcho())
+
+    assert "Passport number" in masked
+    assert "AB1234567" not in masked
+    assert list(mapping.values()) == ["AB1234567"]
+
+
+def test_address_expansion_stays_within_explicit_ru_and_de_address_contexts():
+    cases = (
+        ("Проживает по адресу: г. Казань, ул. Лесная, д. 12.",
+         "ул. Лесная, д. 12", "г. Казань, ул. Лесная, д. 12"),
+        ("Wohnhaft in Lindenstraße 12, 10115 Berlin.",
+         "Lindenstraße 12", "Lindenstraße 12, 10115 Berlin"),
+    )
+    for source, entity_text, expected_value in cases:
+        start = source.index(entity_text)
+        end = start + len(entity_text)
+
+        class AddressDetector:
+            def predict_entities(self, text, labels, threshold):
+                return [{"text": entity_text, "label": "street address",
+                         "start": start, "end": end, "score": 0.9}]
+
+        masked, mapping = anonymize_text(source, AddressDetector())
+        assert expected_value in mapping.values()
+        assert expected_value not in masked

@@ -32,6 +32,7 @@ def main() -> None:
             ],
             check=True,
         )
+        subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
         INSTALL_MARKER.write_text(requirements_hash)
     else:
         print("Pseudonymizer dependencies already installed for this container.", flush=True)

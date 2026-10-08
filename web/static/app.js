@@ -1,6 +1,10 @@
 const $ = (id) => document.getElementById(id);
 let receivedText = "", restoredText = "", sentRequest = null;
 function setText(id, text, empty = false) { const node = $(id); node.textContent = text; node.classList.toggle("empty", empty); }
+function showRequest(request) {
+  sentRequest = request;
+  setText("request", `Модель: ${request.model}\nИнструкции:\n${request.instructions}\n\nВвод:\n${request.input}\n\nСохранение: ${request.store}`);
+}
 
 $("process").addEventListener("click", async () => {
   const button = $("process"); button.disabled = true; receivedText = ""; restoredText = ""; sentRequest = null;
@@ -9,13 +13,14 @@ $("process").addEventListener("click", async () => {
   try {
     const response = await fetch("/api/process", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({document:$("document").value,prompt:$("prompt").value})});
     const result = await response.json();
-    if (result.sent_request) {
-      sentRequest = result.sent_request;
-      setText("request", `Instructions:\n${sentRequest.instructions}\n\nInput:\n${sentRequest.input}\n\nStore: ${sentRequest.store}`);
-    } else if (result.prepared_text) setText("request", `Prepared pseudonymized input (OpenAI request failed):\n${result.prepared_text}`);
+    if (result.sent_request) showRequest(result.sent_request);
+    else if (result.prepared_text) setText("request", `Подготовленный псевдонимизированный текст:\n${result.prepared_text}`);
     if (result.received_text) { receivedText = result.received_text; setText("received", receivedText); }
     if (result.restored_text !== undefined) { restoredText = result.restored_text; setText("restored", restoredText); }
-    if (!response.ok) throw new Error(result.error?.message || "Не удалось обработать текст.");
+    if (!response.ok) {
+      if (result.received_text) document.querySelector('[data-tab="received"]').click();
+      throw new Error(result.error?.message || "Не удалось обработать текст.");
+    }
     $("warnings").textContent = (result.warnings || []).join(" "); $("status").textContent = "Готово";
   } catch (error) {
     $("status").className = "error"; $("status").textContent = error.message || "Ошибка обработки.";
@@ -31,7 +36,10 @@ document.querySelectorAll(".tab").forEach((button) => button.addEventListener("c
 }));
 document.querySelectorAll("[data-copy]").forEach((button) => button.addEventListener("click", async () => {
   const text = button.dataset.copy === "request"
-    ? (sentRequest ? `Instructions:\n${sentRequest.instructions}\n\nInput:\n${sentRequest.input}\n\nStore: ${sentRequest.store}` : "")
+    ? (sentRequest ? `Модель: ${sentRequest.model}\nИнструкции:\n${sentRequest.instructions}\n\nВвод:\n${sentRequest.input}\n\nСохранение: ${sentRequest.store}` : "")
     : (document.querySelector("#restored").classList.contains("hidden") ? receivedText : restoredText);
-  if (text) { await navigator.clipboard.writeText(text); const old = button.textContent; button.textContent = "Скопировано"; setTimeout(() => button.textContent = old, 1200); }
+  if (text) {
+    try { await navigator.clipboard.writeText(text); const old = button.textContent; button.textContent = "Скопировано"; setTimeout(() => button.textContent = old, 1200); }
+    catch (_) { $("status").className = "error"; $("status").textContent = "Не удалось скопировать: браузер запретил доступ к буферу обмена."; }
+  }
 }));

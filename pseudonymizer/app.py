@@ -57,6 +57,7 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None) -
                 logger.error("GLiNER startup failed (%s)", type(exc).__name__)
                 raise RuntimeError(f"Could not initialize CUDA GLiNER: {exc}") from exc
         app.state.store = store or MappingStore()
+        app.state.inference_lock = threading.Lock()
         app.state.ready = True
         yield
         app.state.ready = False
@@ -74,7 +75,8 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None) -
         if not getattr(app.state, "ready", False):
             raise HTTPException(status_code=503, detail="model_not_ready")
         try:
-            safe_text, mapping = anonymize_text(request.text, app.state.detector)
+            with app.state.inference_lock:
+                safe_text, mapping = anonymize_text(request.text, app.state.detector)
         except Exception as exc:
             logger.error("Anonymization failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail="anonymization_failed") from exc

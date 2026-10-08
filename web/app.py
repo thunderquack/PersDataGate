@@ -15,8 +15,8 @@ MAX_INPUT_CHARS = 50_000
 TIMEOUT_SECONDS = 120.0
 OPENAI_INSTRUCTIONS = (
     "Answer the user's request using the supplied document and prompt. "
-    "Preserve every pseudonymization marker exactly as written; do not translate, "
-    "modify, omit, or invent markers."
+    "Preserve each pseudonymization marker you use exactly as written; do not translate, "
+    "modify, or invent markers."
 )
 
 
@@ -26,9 +26,11 @@ class ProcessRequest(BaseModel):
 
 
 class ApiError(Exception):
-    def __init__(self, stage: str, code: str, message: str, *, prepared: str = "", received: str = ""):
+    def __init__(self, stage: str, code: str, message: str, *, prepared: str = "", received: str = "",
+                 sent_request: dict[str, Any] | None = None):
         self.stage, self.code, self.message = stage, code, message
         self.prepared, self.received = prepared, received
+        self.sent_request = sent_request
 
 
 class PseudonymizerClient:
@@ -79,6 +81,7 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
         return JSONResponse(status_code=503 if exc.stage == "configuration" else 502, content={
             "error": {"stage": exc.stage, "code": exc.code, "message": exc.message},
             "prepared_text": exc.prepared, "received_text": exc.received,
+            "sent_request": exc.sent_request,
         })
 
     @app.get("/", response_class=HTMLResponse)
@@ -120,14 +123,14 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
             received = result.output_text
         except Exception:
             raise ApiError("openai", "openai_request_failed", "Не удалось получить ответ OpenAI.",
-                           prepared=prepared) from None
+                           prepared=prepared, sent_request=sent_request) from None
         try:
             restored = await request.app.state.pseudonymizer.deanonymize(mapping_id, received)
             restored_text, warnings = restored["text"], restored.get("warnings", [])
         except Exception:
             raise ApiError("deanonymize", "deanonymization_failed",
                            "Ответ получен, но восстановить исходные значения не удалось.",
-                           prepared=prepared, received=received) from None
+                           prepared=prepared, received=received, sent_request=sent_request) from None
         return {"sent_request": sent_request, "received_text": received,
                 "restored_text": restored_text, "warnings": warnings}
 

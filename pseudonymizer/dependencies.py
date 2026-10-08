@@ -62,7 +62,8 @@ def install_dependencies(requirements: Path, upgrade: bool = False) -> str:
             clean_lines.append(line)
     # Torch is already installed. Resolve its dependencies explicitly on PyPI
     # without requesting the CUDA-only torch distribution from that index.
-    clean_lines.extend(importlib.metadata.requires("torch") or [])
+    torch_dependencies = importlib.metadata.requires("torch") or []
+    clean_lines.extend(torch_dependencies)
 
     with tempfile.TemporaryDirectory(prefix="persdatagate-requirements-") as temp_dir:
         clean_requirements = Path(temp_dir) / "requirements.txt"
@@ -70,11 +71,6 @@ def install_dependencies(requirements: Path, upgrade: bool = False) -> str:
         constraints = Path(temp_dir) / "constraints.txt"
         constraints.write_text(f"torch=={torch_version}\n", encoding="utf-8")
         args = ["install", "--only-binary=:all:", "--index-url", PYPI_INDEX]
-        recovered_wheels = Path(PIP_CACHE) / "recovered-wheels"
-        if recovered_wheels.is_dir():
-            # Optional salvage of already-downloaded NVIDIA wheels. This path is
-            # deliberately excluded from the CUDA-index PyTorch install above.
-            args.extend(["--find-links", str(recovered_wheels)])
         if upgrade:
             args.append("--upgrade")
         args.extend(["-r", str(clean_requirements), "-c", str(constraints)])

@@ -13,7 +13,37 @@ Copy-Item .env.example .env
 docker compose up -d --build
 ```
 
-Подготовка сохраняет образ с Python/CUDA-зависимостями в `.deps/pseudonymizer-deps-py311-cu128-v1.tar` и контрольные суммы в соседнем JSON-файле. Поэтому `docker builder prune` не удаляет его, а после удаления Docker-образов скрипт проверит архив и восстановит образ через `docker load`. CUDA-пакеты скачиваются снова, если удалить архив и манифест. Скрипт останавливается, если pinned-зависимости изменились; тогда поднимите версию `py311-cu128-v1` в обоих pseudonymizer Dockerfile и скрипте.
+Подготовка выполняется в одноразовом Linux-контейнере Python 3.11.12: скачивает wheel-пакеты в `.deps/wheels`, сохраняет pip-кэш в `.deps/pip-cache` и формирует `pseudonymizer/requirements.lock.txt` с точными версиями всех зависимостей и SHA256. При первом запуске используются исходные версии из `pseudonymizer/requirements.txt`. При последующих запусках используется активный lock-файл. Lock-файл следует хранить в Git, многогигабайтные `.deps` — вне Git.
+
+Первичная подготовка скачает CUDA wheel-пакеты заново: старый архив Docker-образа не содержит исходные `.whl`. Архив не используется новым процессом и автоматически не удаляется. Дальнейшие сборки устанавливают пакеты только из `.deps/wheels`, с проверкой хешей и отключённой сетью на шаге установки. Wheels подключаются к этому шагу через BuildKit bind mount и не сохраняются отдельным слоем в образе. Базовый образ Python и зависимости web при необходимости скачиваются отдельно.
+
+`docker builder prune` и удаление Docker-образов не затрагивают `.deps/wheels`. Для обычной пересборки достаточно:
+
+```powershell
+./scripts/prepare-pseudonymizer-dependencies.ps1
+docker compose build --no-cache
+docker compose up -d
+```
+
+## Обновление зависимостей
+
+`pseudonymizer/requirements.in` задаёт диапазоны обновлений в пределах выбранных major-версий и CUDA 12.8. Обновление выполняется отдельно от обычной сборки; рабочий lock-файл автоматически не меняется.
+
+```powershell
+./scripts/prepare-pseudonymizer-dependencies.ps1 -Mode Update
+# Просмотрите .deps/candidate/requirements.lock.txt и сравните с активным lock.
+docker compose build --build-arg REQUIREMENTS_LOCK=.deps/candidate/requirements.lock.txt pseudonymizer
+docker compose up -d --force-recreate pseudonymizer
+docker compose ps
+# Дождитесь healthy, затем проверьте реальную модель:
+Get-Content -Raw -Encoding UTF8 scripts/evaluate_model.py | docker compose exec -T web python -
+# Проверьте также собственные документы и результаты распознавания.
+./scripts/prepare-pseudonymizer-dependencies.ps1 -Mode Promote
+```
+
+`Promote` принимает проверенный кандидат и сохраняет предыдущий lock в `.deps/previous/requirements.lock.txt`. Старые wheels остаются для отката; автоматической уборки нет. Если кандидат не подошёл, активный lock остаётся прежним: пересоберите pseudonymizer обычной командой и пересоздайте контейнер. После принятия предыдущие зависимости можно вернуть, восстановив предыдущий lock и повторив подготовку и сборку.
+
+Планировщик Windows может периодически выполнять `-Mode Update`, чтобы подготовить кандидат; запуск контейнеров и `Promote` остаются отдельными действиями после проверки. Не запускайте несколько подготовок одновременно. Если для зависимости нет совместимого бинарного wheel или версии несовместимы, подготовка завершается ошибкой, не принимая обновление.
 
 Откройте http://localhost:8090. Модель загружается при первом запуске и кешируется в volume `model-cache`; первый запуск занимает больше времени. Без ключа и модели интерфейс доступен, но отправка в OpenAI заблокирована. После изменения `.env` выполните `docker compose up -d --force-recreate web`.
 

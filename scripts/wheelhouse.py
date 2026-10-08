@@ -21,8 +21,9 @@ DEPS = Path('/deps')
 ACTIVE_WHEELS = DEPS / 'wheels'
 ACTIVE_LOCK = ROOT / 'pseudonymizer' / 'requirements.lock.txt'
 CANDIDATE = DEPS / 'candidate'
-CANDIDATE_WHEELS = CANDIDATE / 'wheels'
+# Docker reads one immutable-by-hash wheel pool; locks choose exact versions.
 CANDIDATE_LOCK = CANDIDATE / 'requirements.lock.txt'
+PREVIOUS_LOCK = DEPS / 'previous' / 'requirements.lock.txt'
 PINNED_INPUT = ROOT / 'pseudonymizer' / 'requirements.txt'
 UPDATE_INPUT = ROOT / 'pseudonymizer' / 'requirements.in'
 
@@ -81,7 +82,9 @@ def write_lock(wheels: list[Path], destination: Path) -> None:
     for name in sorted(packages):
         version, hashes = packages[name]
         rendered_name = name.replace('-', '_')
-        lines.append(f'{rendered_name}=={version} \\\n+    ' + ' \\\n+    '.join(f'--hash=sha256:{digest}' for digest in hashes))
+        parts = [f'{rendered_name}=={version}']
+        parts.extend(f'--hash=sha256:{digest}' for digest in hashes)
+        lines.append(' '.join(parts))
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + '.partial')
     temporary.write_text('\n'.join(lines) + '\n', encoding='utf-8')
@@ -90,24 +93,27 @@ def write_lock(wheels: list[Path], destination: Path) -> None:
 
 def parse_lock(path: Path) -> dict[str, tuple[str, set[str]]]:
     requirements: dict[str, tuple[str, set[str]]] = {}
-    current: str | None = None
     for raw_line in path.read_text(encoding='utf-8').splitlines():
         line = raw_line.strip()
         if not line or line.startswith('#'):
             continue
-        if '==' in line and not line.startswith('--hash='):
-            requirement = line.split('\\', 1)[0].strip()
-            name, version = requirement.split('==', 1)
-            current = canonical_name(name)
-            if current in requirements:
-                raise ValueError(f'Duplicate package in lock: {current}')
-            requirements[current] = (version.strip(), set())
-        elif line.startswith('--hash=sha256:') and current:
-            requirements[current][1].add(line.removeprefix('--hash=sha256:'))
-        else:
+        tokens = line.split()
+        if '==' not in tokens[0]:
             raise ValueError(f'Unsupported lock line: {raw_line}')
-    if not requirements or any(not hashes for _, hashes in requirements.values()):
-        raise ValueError(f'Lock is empty or has entries without hashes: {path}')
+        name, version = tokens[0].split('==', 1)
+        key = canonical_name(name)
+        if key in requirements:
+            raise ValueError(f'Duplicate package in lock: {key}')
+        hashes: set[str] = set()
+        for option in tokens[1:]:
+            if not option.startswith('--hash=sha256:'):
+                raise ValueError(f'Unsupported lock option: {option}')
+            hashes.add(option.removeprefix('--hash=sha256:'))
+        if not hashes:
+            raise ValueError(f'Lock entry has no hash: {key}')
+        requirements[key] = (version, hashes)
+    if not requirements:
+        raise ValueError(f'Lock is empty: {path}')
     return requirements
 
 
@@ -123,17 +129,27 @@ def validate_wheelhouse(lock_path: Path, wheel_paths: list[Path]) -> None:
         raise ValueError(f'Wheelhouse does not contain lock-matching wheels: {", ".join(missing)}')
 
 
-def pip_download(requirements: Path, destination: Path, find_links: list[Path], *, locked: bool) -> None:
+def pip_download(
+    requirements: Path,
+    destination: Path,
+    find_links: list[Path],
+    *,
+    locked: bool,
+    constraints: Path | None = None,
+) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     command = [
         sys.executable, '-m', 'pip', 'download', '--disable-pip-version-check',
         '--only-binary=:all:', '--dest', str(destination),
+        '--extra-index-url', 'https://download.pytorch.org/whl/cu128',
     ]
     for directory in find_links:
         if directory.exists():
             command.extend(['--find-links', str(directory)])
     if locked:
         command.extend(['--require-hashes', '--no-deps'])
+    if constraints:
+        command.extend(['-c', str(constraints)])
     command.extend(['-r', str(requirements)])
     subprocess.run(command, check=True)
 
@@ -170,7 +186,9 @@ def requirements_missing_from_lock(lock: Path, wheel_dir: Path, destination: Pat
     lines: list[str] = []
     for name in sorted(missing):
         version, hashes = expected[name]
-        lines.append(f'{name}=={version} \\\n+    ' + ' \\\n+    '.join(f'--hash=sha256:{digest}' for digest in sorted(hashes)))
+        parts = [f"{name}=={version}"]
+        parts.extend(f"--hash=sha256:{digest}" for digest in sorted(hashes))
+        lines.append(' '.join(parts))
     requirement_file = destination / 'missing-requirements.txt'
     requirement_file.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     return requirement_file
@@ -194,9 +212,12 @@ def prepare() -> None:
             if not staged:
                 raise ValueError('pip did not produce any wheels from the pinned requirements.')
             assert_torch_cuda(staged)
-            write_lock(staged, ACTIVE_LOCK)
             merged = merge_wheels(staging, ACTIVE_WHEELS)
-            validate_wheelhouse(ACTIVE_LOCK, merged)
+            temporary_lock = ACTIVE_LOCK.with_suffix('.prepare')
+            write_lock(staged, temporary_lock)
+            validate_wheelhouse(temporary_lock, merged)
+            ACTIVE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+            temporary_lock.replace(ACTIVE_LOCK)
     print(f'Active lock ready: {ACTIVE_LOCK.relative_to(ROOT)}')
     print(f'Wheel files retained in {ACTIVE_WHEELS}')
 
@@ -211,23 +232,34 @@ def assert_torch_cuda(wheels: list[Path]) -> None:
 def update() -> None:
     if not UPDATE_INPUT.exists():
         raise FileNotFoundError(f'Compatible update constraints not found: {UPDATE_INPUT}')
-    CANDIDATE_WHEELS.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='update-', dir=DEPS) as temp:
         staging = Path(temp) / 'wheels'
-        pip_download(UPDATE_INPUT, staging, [ACTIVE_WHEELS], locked=False)
+        torch_staging = Path(temp) / 'torch'
+        torch_staging.mkdir(parents=True, exist_ok=True)
+        torch_constraint = read_torch_constraint(UPDATE_INPUT)
+        torch_download = [
+            sys.executable, '-m', 'pip', 'download', '--disable-pip-version-check',
+            '--index-url', 'https://download.pytorch.org/whl/cu128',
+            '--only-binary=:all:', '--no-deps', '--dest', str(torch_staging),
+        ]
+        if ACTIVE_WHEELS.exists():
+            torch_download.extend(['--find-links', str(ACTIVE_WHEELS)])
+        torch_download.append(torch_constraint)
+        subprocess.run(torch_download, check=True)
+        torch_only = wheels_in(torch_staging)
+        assert_torch_cuda(torch_only)
+        torch_version = wheel_metadata(torch_only[0])[1]
+        constraints = Path(temp) / 'constraints.txt'
+        constraints.write_text(f'torch=={torch_version}\n', encoding='utf-8')
+        pip_download(UPDATE_INPUT, staging, [ACTIVE_WHEELS, torch_staging], locked=False, constraints=constraints)
         downloaded = wheels_in(staging)
         if not downloaded:
             raise ValueError('pip did not produce any candidate wheels.')
         assert_torch_cuda(downloaded)
-        # Retain only the artifacts selected for this candidate. The active wheelhouse
-        # remains unchanged until the candidate lock is explicitly promoted.
-        for wheel in downloaded:
-            destination = CANDIDATE_WHEELS / wheel.name
-            if destination.exists() and sha256(destination) != sha256(wheel):
-                raise ValueError(f'Candidate wheel filename collision: {wheel.name}')
-            shutil.copy2(wheel, destination)
+        # Candidate artifacts are additive; old wheels remain available for rollback.
+        merged = merge_wheels(staging, ACTIVE_WHEELS)
         write_lock(downloaded, CANDIDATE_LOCK)
-        validate_wheelhouse(CANDIDATE_LOCK, wheels_in(CANDIDATE_WHEELS))
+        validate_wheelhouse(CANDIDATE_LOCK, merged)
     print(f'Candidate lock ready: {CANDIDATE_LOCK.relative_to(DEPS)}')
     print('Build and validate this candidate image before running Promote.')
 
@@ -235,21 +267,31 @@ def update() -> None:
 def promote() -> None:
     if not CANDIDATE_LOCK.exists():
         raise FileNotFoundError('No candidate lock exists. Run Update and validate the candidate first.')
-    validate_wheelhouse(CANDIDATE_LOCK, wheels_in(CANDIDATE_WHEELS))
-    ACTIVE_WHEELS.mkdir(parents=True, exist_ok=True)
-    for wheel in wheels_in(CANDIDATE_WHEELS):
-        destination = ACTIVE_WHEELS / wheel.name
-        if destination.exists() and sha256(destination) != sha256(wheel):
-            raise ValueError(f'Active wheel filename collision: {wheel.name}')
-        if not destination.exists():
-            shutil.copy2(wheel, destination)
     validate_wheelhouse(CANDIDATE_LOCK, wheels_in(ACTIVE_WHEELS))
+    if ACTIVE_LOCK.exists() and ACTIVE_LOCK.read_bytes() == CANDIDATE_LOCK.read_bytes():
+        print('Candidate is already the active lock; nothing to promote.')
+        return
     ACTIVE_LOCK.parent.mkdir(parents=True, exist_ok=True)
     temporary = ACTIVE_LOCK.with_suffix(ACTIVE_LOCK.suffix + '.partial')
+    if ACTIVE_LOCK.exists():
+        PREVIOUS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        previous_temporary = PREVIOUS_LOCK.with_suffix(PREVIOUS_LOCK.suffix + '.partial')
+        shutil.copy2(ACTIVE_LOCK, previous_temporary)
+        previous_temporary.replace(PREVIOUS_LOCK)
     shutil.copy2(CANDIDATE_LOCK, temporary)
     temporary.replace(ACTIVE_LOCK)
     print(f'Promoted candidate lock to {ACTIVE_LOCK.relative_to(ROOT)}')
     print('The next Compose build will install the promoted versions from local wheels.')
+
+
+def read_torch_constraint(path: Path) -> str:
+    for raw_line in path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or line.startswith('--'):
+            continue
+        if re.match(r'^torch\s*[<>=!~]', line):
+            return re.sub(r'\s+', '', line)
+    raise ValueError(f'No torch version bounds found in {path}')
 
 
 def main() -> int:

@@ -1,13 +1,10 @@
-FROM python:3.11.12-slim
+FROM persdatagate-pseudonymizer-deps:py311-cu128-v1
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/models/huggingface
 
 WORKDIR /app
-COPY pseudonymizer/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-RUN pip install --no-cache-dir hf-xet==1.3.0
 COPY pseudonymizer /app/pseudonymizer
 
 EXPOSE 8000

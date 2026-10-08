@@ -9,8 +9,11 @@
 ```powershell
 Copy-Item .env.example .env
 # Заполните OPENAI_API_KEY и OPENAI_MODEL в .env локально.
+./scripts/prepare-pseudonymizer-dependencies.ps1
 docker compose up -d --build
 ```
+
+Подготовка сохраняет образ с Python/CUDA-зависимостями в `.deps/pseudonymizer-deps-py311-cu128-v1.tar`. Поэтому `docker builder prune` не удаляет его, а после удаления Docker-образов скрипт восстановит его через `docker load`. CUDA-пакеты скачиваются снова только если удалить и этот архив. При обновлении pinned-зависимостей нужно также поднять версию `py311-cu128-v1` в обоих pseudonymizer Dockerfile и скрипте.
 
 Откройте http://localhost:8090. Модель загружается при первом запуске и кешируется в volume `model-cache`; первый запуск занимает больше времени. Без ключа и модели интерфейс доступен, но отправка в OpenAI заблокирована. После изменения `.env` выполните `docker compose up -d --force-recreate web`.
 

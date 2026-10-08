@@ -1,0 +1,8 @@
+FROM python:3.11.12-slim
+
+COPY pseudonymizer/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && pip install --no-cache-dir hf-xet==1.3.0
+
+LABEL org.opencontainers.image.title="PersDataGate pseudonymizer dependencies"
+LABEL org.persdatagate.dependencies-version="py311-cu128-v1"

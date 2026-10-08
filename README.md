@@ -13,37 +13,39 @@ Copy-Item .env.example .env
 docker compose up -d --build
 ```
 
-Подготовка выполняется в одноразовом Linux-контейнере Python 3.11.12: скачивает wheel-пакеты в `.deps/wheels`, сохраняет pip-кэш в `.deps/pip-cache` и формирует `pseudonymizer/requirements.lock.txt` с точными версиями всех зависимостей и SHA256. При первом запуске используются исходные версии из `pseudonymizer/requirements.txt`. При последующих запусках используется активный lock-файл. Lock-файл следует хранить в Git, многогигабайтные `.deps` — вне Git.
+Зависимости pseudonymizer устанавливаются при первом старте каждого нового контейнера через `pip install -r requirements.txt`. Pip-кэш напрямую подключён с диска проекта: `.deps/pip-cache` → `/pip-cache`. При перезапуске того же контейнера установка пропускается, если файл зависимостей не изменился. После пересоздания контейнера установка выполняется снова и использует постоянный pip-кэш. Сборка образа pseudonymizer не скачивает Python/CUDA-пакеты; до завершения установки и загрузки GLiNER сервис не готов.
 
-Первичная подготовка скачает CUDA wheel-пакеты заново: старый архив Docker-образа не содержит исходные `.whl`. Архив не используется новым процессом и автоматически не удаляется. Дальнейшие сборки устанавливают пакеты только из `.deps/wheels`, с проверкой хешей и отключённой сетью на шаге установки. Wheels подключаются к этому шагу через BuildKit bind mount и не сохраняются отдельным слоем в образе. Базовый образ Python и зависимости web при необходимости скачиваются отдельно.
+Подготовительный скрипт необязателен: он заранее устанавливает зависимости в одноразовом Linux-контейнере и наполняет тот же кэш. Установленное окружение одноразового контейнера удаляется, кэш сохраняется. Скрипт можно пропустить и выполнить сразу `docker compose up -d --build`.
 
-`docker builder prune` и удаление Docker-образов не затрагивают `.deps/wheels`. Для обычной пересборки достаточно:
+Кэш pip переживает `docker builder prune`, удаление образов и `docker compose down -v`, поскольку хранится в обычной папке проекта. Том модели отдельно: `down -v` удаляет его. Pip может обращаться в интернет за метаданными и использовать сохранённые HTTP-ответы и файлы пакетов. Повторное скачивание возможно, если кэш удалён, ответ сервера нельзя кешировать или нужна новая версия. Это обычный кэш pip, не гарантированная установка без сети. Старые архивы и wheels в `.deps` не используются и автоматически не удаляются.
+
+Команды пересборки:
 
 ```powershell
-./scripts/prepare-pseudonymizer-dependencies.ps1
 docker compose build --no-cache
 docker compose up -d
+docker compose logs -f pseudonymizer
 ```
 
 ## Обновление зависимостей
 
-`pseudonymizer/requirements.in` задаёт диапазоны обновлений в пределах выбранных major-версий и CUDA 12.8. Обновление выполняется отдельно от обычной сборки; рабочий lock-файл автоматически не меняется.
+Обычный запуск использует версии из `pseudonymizer/requirements.txt`. Чтобы подготовить новые версии в пределах диапазонов `pseudonymizer/requirements.in` и CUDA 12.8:
 
 ```powershell
 ./scripts/prepare-pseudonymizer-dependencies.ps1 -Mode Update
-# Просмотрите .deps/candidate/requirements.lock.txt и сравните с активным lock.
-docker compose build --build-arg REQUIREMENTS_LOCK=.deps/candidate/requirements.lock.txt pseudonymizer
+# Просмотрите .deps/requirements.updated.txt и сравните с текущими версиями.
+git diff --no-index pseudonymizer/requirements.txt .deps/requirements.updated.txt
+# Применение — отдельное действие после просмотра:
+Copy-Item pseudonymizer/requirements.txt .deps/requirements.previous.txt
+Copy-Item .deps/requirements.updated.txt pseudonymizer/requirements.txt
+docker compose build pseudonymizer
 docker compose up -d --force-recreate pseudonymizer
+# Дождитесь healthy и проверьте модель и собственные примеры:
 docker compose ps
-# Дождитесь healthy, затем проверьте реальную модель:
 Get-Content -Raw -Encoding UTF8 scripts/evaluate_model.py | docker compose exec -T web python -
-# Проверьте также собственные документы и результаты распознавания.
-./scripts/prepare-pseudonymizer-dependencies.ps1 -Mode Promote
 ```
 
-`Promote` принимает проверенный кандидат и сохраняет предыдущий lock в `.deps/previous/requirements.lock.txt`. Старые wheels остаются для отката; автоматической уборки нет. Если кандидат не подошёл, активный lock остаётся прежним: пересоберите pseudonymizer обычной командой и пересоздайте контейнер. После принятия предыдущие зависимости можно вернуть, восстановив предыдущий lock и повторив подготовку и сборку.
-
-Планировщик Windows может периодически выполнять `-Mode Update`, чтобы подготовить кандидат; запуск контейнеров и `Promote` остаются отдельными действиями после проверки. Не запускайте несколько подготовок одновременно. Если для зависимости нет совместимого бинарного wheel или версии несовместимы, подготовка завершается ошибкой, не принимая обновление.
+`Update` устанавливает кандидат в одноразовый контейнер, проверяет зависимости через `pip check` и сохраняет точные версии из `pip freeze`; рабочий файл не меняется. Это проверка разрешения зависимостей, а не проверка работы модели. Откат: восстановите `pseudonymizer/requirements.txt` из `.deps/requirements.previous.txt`, пересоберите образ и пересоздайте pseudonymizer. Не запускайте подготовку и установку сервиса одновременно с одним pip-кэшем.
 
 Откройте http://localhost:8090. Модель загружается при первом запуске и кешируется в volume `model-cache`; первый запуск занимает больше времени. Без ключа и модели интерфейс доступен, но отправка в OpenAI заблокирована. После изменения `.env` выполните `docker compose up -d --force-recreate web`.
 

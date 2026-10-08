@@ -1,30 +1,20 @@
 param(
-    [ValidateSet('Prepare', 'Update', 'Promote')]
+    [ValidateSet('Prepare', 'Update')]
     [string]$Mode = 'Prepare'
 )
 
 $ErrorActionPreference = 'Stop'
-
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $depsDir = Join-Path $repoRoot '.deps'
-New-Item -ItemType Directory -Force -Path $depsDir | Out-Null
-
-$docker = Get-Command docker -ErrorAction SilentlyContinue
-if (-not $docker) {
-    throw 'Docker CLI was not found. Install Docker Desktop, then rerun this command.'
+$cacheDir = Join-Path $depsDir 'pip-cache'
+New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+    throw 'Docker CLI was not found.'
 }
-
-Write-Host "Running wheelhouse mode '$Mode' in Python 3.11.12 Linux."
-Write-Host "Persistent wheels and pip cache: $depsDir"
-
+Write-Host "Mode: $Mode. Persistent pip cache: $cacheDir"
 docker run --rm `
-    --mount "type=bind,source=$repoRoot,target=/repo" `
+    --mount "type=bind,source=$repoRoot,target=/repo,readonly" `
     --mount "type=bind,source=$depsDir,target=/deps" `
     --env PIP_CACHE_DIR=/deps/pip-cache `
-    --workdir /repo `
-    python:3.11.12-slim `
-    python /repo/scripts/wheelhouse.py $Mode
-
-if ($LASTEXITCODE -ne 0) {
-    throw "Wheelhouse preparation failed with exit code $LASTEXITCODE."
-}
+    python:3.11.12-slim python /repo/scripts/pip_cache.py $Mode
+if ($LASTEXITCODE -ne 0) { throw "Dependency preparation failed: $LASTEXITCODE" }

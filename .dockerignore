@@ -1,11 +1,5 @@
 .git
-.deps/*
-!.deps/wheels/
-.deps/wheels/*
-!.deps/wheels/*.whl
-!.deps/candidate/
-.deps/candidate/*
-!.deps/candidate/requirements.lock.txt
+.deps
 .env
 .env.*
 .venv

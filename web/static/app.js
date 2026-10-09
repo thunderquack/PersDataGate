@@ -47,14 +47,9 @@ function showRows(id, rows, columns, emptyMessage, unavailableMessage) {
 function showSteps(result) {
   const steps = result.steps || {};
   const sources = {gliner: "GLiNER 2.5", rule: "Правило"};
-  const statuses = {restored: "Восстановлено", uncertain: "Неуверенно — маркер сохранён", unknown: "Неизвестный маркер"};
+  const statuses = {restored: "Восстановлено", unknown: "Неизвестный маркер"};
   const reasons = {
-    recipient_address: "Поле имени в немецком адресном блоке",
-    model_selected: "Форма выбрана Qwen",
-    model_uncertain: "Qwen выбрала null",
-    invalid_model_choice: "Недопустимый выбор Qwen",
-    local_model_error: "Ошибка локальной модели",
-    no_forms: "Нет допустимых словоформ",
+    saved_value: "Сохранённое значение",
   };
   showRows("entities", steps.entities?.map((row) => ({...row, source: sources[row.source] || row.source})), [
     ["value", "Найденный текст"], ["code", "Тип"], ["source", "Источник"], ["start", "Начало"], ["end", "Конец"],
@@ -68,7 +63,7 @@ function showSteps(result) {
   showRows("restorations", steps.restorations?.map((row) => ({...row,
     status: statuses[row.status] || row.status, reason: reasons[row.reason] || row.reason})), [
     ["marker", "Маркер"], ["value", "Подставленное значение"], ["status", "Результат"], ["reason", "Причина"], ["start", "Начало"], ["end", "Конец"],
-  ], "В ответе нет маркеров для восстановления.", "Сервер не передал сведения о восстановленных именах и словоформах.");
+  ], "В ответе нет маркеров для восстановления.", "Сервер не передал сведения о восстановленных значениях.");
 }
 
 function clearSteps() {

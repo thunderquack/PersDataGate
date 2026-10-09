@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from common.pipeline_log import PipelineLogError, event
+from common.pipeline_log import event
 
 CHUNK_SIZE = 700
 CHUNK_OVERLAP = 120
@@ -465,45 +465,17 @@ def restore_text(text: str, mapping: dict[str, str], pipeline: Any | None = None
                 "marker": marker, "start": match.start(), "end": match.end(),
                 "value": None, "status": "unknown",
             })
-    # Single pass avoids interpreting text restored from a source value.
-    persons = getattr(mapping, "persons", {})
-
+    # Single pass avoids interpreting text restored from a source value. The
+    # compatibility `pipeline` argument is intentionally unused: restoration
+    # is always the exact value recorded during anonymization.
     def replace(match: re.Match[str]) -> str:
         marker = match.group(0)
         if marker not in known:
             return marker
-        record = persons.get(marker)
-        if record is None or pipeline is None:
-            value = mapping[marker]
-            occurrences.append({
-                "marker": marker, "start": match.start(), "end": match.end(),
-                "value": value, "status": "restored",
-            })
-            return value
-        reason = "model_selected"
-        try:
-            detailed = getattr(pipeline, "restore_with_details", None)
-            if detailed is not None:
-                value, reason = detailed(text, marker, record, match.start(), match.end())
-            else:
-                value = pipeline.restore(text, marker, record, match.start(), match.end())
-                if value is None:
-                    reason = "model_uncertain"
-        except PipelineLogError:
-            raise
-        except Exception:
-            value = None
-            reason = "local_model_error"
-        if value is None:
-            warnings.append("Could not safely inflect a person name; marker left unchanged.")
-            occurrences.append({
-                "marker": marker, "start": match.start(), "end": match.end(),
-                "value": None, "status": "uncertain", "reason": reason,
-            })
-            return marker
+        value = mapping[marker]
         occurrences.append({
             "marker": marker, "start": match.start(), "end": match.end(),
-            "value": value, "status": "restored", "reason": reason,
+            "value": value, "status": "restored", "reason": "saved_value",
         })
         return value
 

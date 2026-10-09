@@ -80,9 +80,44 @@ def test_repeated_unicode_values_share_marker_and_restore_once():
 def test_restoration_is_one_pass_when_original_value_looks_like_marker():
     marker = "⟦PERSON_" + "a" * 32 + "_1⟧"
     nested_marker = "⟦PERSON_" + "b" * 32 + "_2⟧"
-    text, warnings = restore_text(marker, {marker: nested_marker})
+    text, warnings = restore_text(marker, {marker: nested_marker, nested_marker: "must not be inserted"})
     assert text == nested_marker
     assert warnings == []
+
+
+def test_all_known_markers_restore_saved_values_without_calling_pipeline_and_report_reason():
+    from pseudonymizer.persons import PersonRecord
+    from pseudonymizer.service import PseudonymMapping
+
+    class ForbiddenPipeline:
+        def restore(self, *args):
+            raise AssertionError("Known source values must not be sent to a model")
+
+        def restore_with_details(self, *args):
+            raise AssertionError("Known source values must not be sent to a model")
+
+    person = "⟦PERSON_demo_1⟧"
+    phone = "⟦PHONE_demo_1⟧"
+    address = "⟦ADDRESS_demo_1⟧"
+    unknown = "⟦PERSON_unknown_1⟧"
+    mapping = PseudonymMapping()
+    mapping[person] = "Élise Müller"
+    mapping.persons[person] = PersonRecord("p1", "Élise Müller", ("Élise Müller",))
+    mapping[phone] = "+49 30 555 01904"
+    mapping[address] = "Sonnenallee 118, 12059 Berlin"
+    text = f"{person} / {person} / {phone} / {phone} / {address} / {unknown}"
+    steps = {}
+
+    restored, warnings = restore_text(text, mapping, ForbiddenPipeline(), steps=steps)
+
+    assert restored == (
+        "Élise Müller / Élise Müller / +49 30 555 01904 / +49 30 555 01904 / "
+        "Sonnenallee 118, 12059 Berlin / ⟦PERSON_unknown_1⟧"
+    )
+    occurrences = steps["restorations"]
+    assert [item["status"] for item in occurrences] == ["restored"] * 5 + ["unknown"]
+    assert [item["reason"] for item in occurrences[:5]] == ["saved_value"] * 5
+    assert len(warnings) == 1
 
 
 def test_format_rule_wins_over_overlapping_model_span():
@@ -254,20 +289,20 @@ def test_rich_person_mapping_api_restoration_warning_and_ttl():
             return {spans[0].start: PersonRecord("one", source, (source,))}, ["link warning"]
 
         def restore(self, *args):
-            return None
+            raise AssertionError("Known source values must be restored literally")
 
     with TestClient(create_app(detector=detector, store=store, pipeline=Pipeline())) as client:
         masked = client.post("/anonymize", json={"text": source}).json()
         assert masked["warnings"] == ["link warning"]
         assert source not in str(masked)
         result = client.post("/deanonymize", json={"mapping_id": masked["mapping_id"], "text": masked["text"]})
-        assert result.json()["text"] == masked["text"]
-        assert len(result.json()["warnings"]) == 2
+        assert result.json()["text"] == source
+        assert result.json()["warnings"] == ["link warning"]
         clock[0] = 5
         assert client.post("/deanonymize", json={"mapping_id": masked["mapping_id"], "text": masked["text"]}).status_code == 404
 
 
-def test_opt_in_steps_capture_entities_clusters_and_occurrence_forms():
+def test_opt_in_steps_capture_entities_clusters_and_saved_value_restorations():
     from pseudonymizer.persons import PersonRecord
 
     source = "Иван Петров; Ивана Петрова; a@example.org"
@@ -280,7 +315,7 @@ def test_opt_in_steps_capture_entities_clusters_and_occurrence_forms():
             return {span.start: record for span in spans}, []
 
         def restore(self, text, marker, record, start, end):
-            return "Ивану Петрову" if start == 0 else None
+            raise AssertionError("Known source values must be restored literally")
 
     with TestClient(create_app(detector=detector, pipeline=Pipeline())) as client:
         default = client.post("/anonymize", json={"text": source}).json()
@@ -297,16 +332,16 @@ def test_opt_in_steps_capture_entities_clusters_and_occurrence_forms():
             "mapping_id": traced["mapping_id"], "text": answer, "include_steps": True
         }).json()
         occurrences = restored["steps"]["restorations"]
-        assert [item["status"] for item in occurrences] == ["restored", "uncertain", "unknown"]
-        assert occurrences[0]["value"] == "Ивану Петрову"
-        assert occurrences[1]["value"] is None
+        assert [item["status"] for item in occurrences] == ["restored", "restored", "unknown"]
+        assert [item["value"] for item in occurrences[:2]] == ["Иван Петров", "Иван Петров"]
+        assert [item["reason"] for item in occurrences[:2]] == ["saved_value", "saved_value"]
         # Each response trace is fresh; the original private mapping stays usable.
         repeated = client.post("/deanonymize", json={"mapping_id": traced["mapping_id"], "text": marker}).json()
         assert "steps" not in repeated
-        assert repeated["text"] == "Ивану Петрову"
+        assert repeated["text"] == "Иван Петров"
 
 
-def test_address_restoration_trace_reports_reason_without_calling_qwen():
+def test_person_restoration_uses_saved_value_even_in_german_recipient_address():
     from pseudonymizer.persons import PersonPipeline, PersonRecord
     from pseudonymizer.service import PseudonymMapping
 
@@ -322,6 +357,6 @@ def test_address_restoration_trace_reports_reason_without_calling_qwen():
     trace = {}
     restored, warnings = restore_text(text, mapping, PersonPipeline(ForbiddenGenerator()), steps=trace)
     assert restored.startswith("An\nEgor Ivanov\n")
-    assert trace["restorations"][0]["reason"] == "recipient_address"
+    assert trace["restorations"][0]["reason"] == "saved_value"
     assert trace["restorations"][0]["status"] == "restored"
     assert all("inflect" not in warning for warning in warnings)

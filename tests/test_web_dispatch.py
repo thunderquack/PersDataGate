@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import os
+from pathlib import Path
+from uuid import UUID
 from types import SimpleNamespace
 
 import httpx
@@ -375,3 +378,16 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
     }
     assert body["received_text"].startswith("Hello ⟦PERSON_")
     assert body["restored_text"] == "Hello Alice Example"
+    pipeline_id = body["pipeline_id"]
+    assert str(UUID(pipeline_id)) == pipeline_id
+    directory = Path(os.environ["PIPELINE_LOG_DIR"]) / pipeline_id
+    web_records = [json.loads(line) for line in (directory / "web.jsonl").read_text(encoding="utf-8").splitlines()]
+    pseudo_records = [json.loads(line) for line in (directory / "pseudonymizer.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert all(record["pipeline_id"] == pipeline_id for record in web_records + pseudo_records)
+    assert {"web.input", "web.anonymized", "openai.request", "openai.response", "web.restored"} <= {r["stage"] for r in web_records}
+    assert {"ner.chunk", "ner.selected", "anonymize.result", "restore.result"} <= {r["stage"] for r in pseudo_records}
+    records_text = json.dumps(web_records + pseudo_records)
+    assert "Alice Example" in records_text
+    assert "alice@example.org" in records_text
+    assert "synthetic-test-key" not in records_text
+    assert pipeline_id not in json.dumps(wire)

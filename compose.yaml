@@ -2,9 +2,12 @@ name: persdatagate
 
 services:
   pseudonymizer:
+    image: persdatagate-pseudonymizer:cuda
     build:
       context: .
       dockerfile: pseudonymizer/Dockerfile
+      args:
+        DEVICE: cuda
     gpus: all
     environment:
       DEVICE: cuda
@@ -16,8 +19,8 @@ services:
       HF_XET_HIGH_PERFORMANCE: "1"
     volumes:
       - model-cache:/models
-      - ./.deps/pip-cache:/pip-cache
       - ./logs/pipelines:/pipeline-logs
+      - ./pseudonymizer/requirements.txt:/app/pseudonymizer/requirements.txt:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5)"]
       interval: 15s

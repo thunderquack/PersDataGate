@@ -126,16 +126,14 @@ def test_invalid_device_fails_before_loading_model(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("device", "expected_torch", "expected_index", "upgrade"),
+    ("device", "expected_torch", "expected_index"),
     [
-        ("cpu", "2.7.1+cpu", "https://download.pytorch.org/whl/cpu", False),
-        ("cuda", "2.7.1+cu128", "https://download.pytorch.org/whl/cu128", False),
-        ("cpu", "2.7.1+cpu", "https://download.pytorch.org/whl/cpu", True),
-        ("cuda", "2.7.1+cu128", "https://download.pytorch.org/whl/cu128", True),
+        ("cpu", "2.7.1+cpu", "https://download.pytorch.org/whl/cpu"),
+        ("cuda", "2.7.1+cu128", "https://download.pytorch.org/whl/cu128"),
     ],
 )
-def test_dependency_installer_selects_torch_build_and_keeps_other_deps_on_pypi(
-    monkeypatch, tmp_path: Path, device, expected_torch, expected_index, upgrade
+def test_base_dependency_installer_selects_torch_build_and_keeps_other_deps_on_pypi(
+    monkeypatch, tmp_path: Path, device, expected_torch, expected_index
 ):
     requirements = tmp_path / f"requirements.{device}.txt"
     requirements.write_text(
@@ -143,7 +141,6 @@ def test_dependency_installer_selects_torch_build_and_keeps_other_deps_on_pypi(
         f"torch=={expected_torch}\nfastapi==0.115.12\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(dependencies, "PIP_CACHE", str(tmp_path / "pip-cache"))
     monkeypatch.setattr(importlib.metadata, "version", lambda name: expected_torch)
     monkeypatch.setattr(importlib.metadata, "requires", lambda name: ["filelock>=3"])
     pip_calls = []
@@ -161,13 +158,18 @@ def test_dependency_installer_selects_torch_build_and_keeps_other_deps_on_pypi(
             assert constraints_file.read_text(encoding="utf-8") == f"torch=={expected_torch}\n"
 
     monkeypatch.setattr(dependencies, "_pip", fake_pip)
-    assert dependencies.install_dependencies(requirements, device=device, upgrade=upgrade) == expected_torch
+    assert dependencies.install_dependencies(requirements, device=device) == expected_torch
     assert len(pip_calls) == 2
     assert pip_calls[0][pip_calls[0].index("--index-url") + 1] == expected_index
     assert pip_calls[0][-1] == f"torch=={expected_torch}"
     assert pip_calls[1][pip_calls[1].index("--index-url") + 1] == dependencies.PYPI_INDEX
-    assert ("--upgrade" in pip_calls[0]) is upgrade
-    assert ("--upgrade" in pip_calls[1]) is upgrade
+
+
+def test_pip_invocations_disable_download_cache(monkeypatch):
+    calls = []
+    monkeypatch.setattr(dependencies.subprocess, "run", lambda command, **kwargs: calls.append(command))
+    dependencies._pip("install", "sample==1")
+    assert "--no-cache-dir" in calls[0]
 
 
 @pytest.mark.parametrize(("device", "wrong_version"), [("cpu", "2.7.1+cu128"), ("cuda", "2.7.1+cpu")])
@@ -202,33 +204,52 @@ def test_cpu_requirements_do_not_request_cuda_or_nvidia_packages():
     assert "nvidia-" not in contents
 
 
-def test_bootstrap_install_fingerprint_includes_device_and_skips_same_device(
-    monkeypatch, tmp_path: Path
-):
-    cpu_requirements = tmp_path / "requirements.cpu.txt"
-    cuda_requirements = tmp_path / "requirements.cuda.txt"
-    cpu_requirements.write_text("torch==2.7.1+cpu\n", encoding="utf-8")
-    # Identical requirements make this prove the device prefix itself changes
-    # the install fingerprint, rather than only the selected file contents.
-    cuda_requirements.write_text("torch==2.7.1+cpu\n", encoding="utf-8")
-    marker = tmp_path / "installed.sha256"
-    monkeypatch.setattr(bootstrap, "REQUIREMENTS", {"cpu": cpu_requirements, "cuda": cuda_requirements})
-    monkeypatch.setattr(bootstrap, "INSTALL_MARKER", marker)
+def test_runtime_installer_uses_constraints_and_skips_empty_requirements(monkeypatch, tmp_path: Path):
+    requirements = tmp_path / "requirements.txt"
+    constraints = tmp_path / "base-constraints.txt"
+    requirements.write_text("\n# no optional additions yet\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(dependencies, "_pip", lambda *args: calls.append(args))
+    dependencies.install_runtime_dependencies(requirements, constraints)
+    assert calls == []
+
+    requirements.write_text("rapidfuzz==3.12.2\n", encoding="utf-8")
+    dependencies.install_runtime_dependencies(requirements, constraints)
+    assert len(calls) == 1
+    assert calls[0] == (
+        "install", "--only-binary=:all:", "--index-url", dependencies.PYPI_INDEX,
+        "-r", str(requirements), "-c", str(constraints),
+    )
+
+
+def test_bootstrap_validates_image_device_before_installing_delta(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("DEVICE", "cpu")
+    monkeypatch.setenv("BASE_DEVICE", "cuda")
+    monkeypatch.setattr(bootstrap, "REQUIREMENTS", tmp_path / "requirements.txt")
     installs = []
-    monkeypatch.setattr(bootstrap, "install_dependencies", lambda path, device: installs.append((path, device)))
-    monkeypatch.setattr(bootstrap.subprocess, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bootstrap, "install_runtime_dependencies", lambda *args: installs.append(args))
+    with pytest.raises(RuntimeError, match="image contains the cuda"):
+        bootstrap.main()
+    assert installs == []
+
+
+def test_bootstrap_checks_runtime_delta_and_starts_service(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("DEVICE", "cpu")
+    monkeypatch.setenv("BASE_DEVICE", "cpu")
+    requirements = tmp_path / "requirements.txt"
+    monkeypatch.setattr(bootstrap, "REQUIREMENTS", requirements)
+    constraints = tmp_path / "constraints.txt"
+    monkeypatch.setattr(bootstrap, "BASE_CONSTRAINTS", constraints)
+    installs = []
+    monkeypatch.setattr(bootstrap, "install_runtime_dependencies", lambda *args: installs.append(args))
+    checks = []
+    monkeypatch.setattr(bootstrap.subprocess, "run", lambda *args, **kwargs: checks.append(args))
 
     class StopAfterStart(Exception):
         pass
 
     monkeypatch.setattr(bootstrap.os, "execvpe", lambda *args: (_ for _ in ()).throw(StopAfterStart()))
-    for device in ("cpu", "cpu", "cuda"):
-        monkeypatch.setenv("DEVICE", device)
-        with pytest.raises(StopAfterStart):
-            bootstrap.main()
-
-    assert installs == [(cpu_requirements, "cpu"), (cuda_requirements, "cuda")]
-    assert cpu_requirements.read_bytes() == cuda_requirements.read_bytes()
-    assert marker.read_text(encoding="utf-8") == (
-        "cuda:" + __import__("hashlib").sha256(cuda_requirements.read_bytes()).hexdigest()
-    )
+    with pytest.raises(StopAfterStart):
+        bootstrap.main()
+    assert installs == [(requirements, constraints)]
+    assert checks == [([sys.executable, "-m", "pip", "check"],)]

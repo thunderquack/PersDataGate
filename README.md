@@ -17,37 +17,32 @@ docker compose -f compose.yaml -f compose.cpu.yaml up -d --build
 
 Откройте http://localhost:8090. Compose задаёт `DEVICE=cuda` или `DEVICE=cpu`; при запуске Python вне Compose настройка читается из окружения и по умолчанию равна `cuda`. Другие значения отклоняются. В CUDA-режиме отсутствие GPU завершает запуск ошибкой; автоматического перехода на CPU нет. Внутренний тайм-аут — 600 секунд (`PSEUDONYMIZER_TIMEOUT_SECONDS`), OpenAI — 120 секунд.
 
-У обоих режимов один сервис и API. GLiNER распознаёт персональные данные, общая локальная Qwen3 1.7B связывает имена и выбирает словоформы. Qwen загружается один раз: FP16 на CUDA, FP32 на CPU. Переключение режима пересоздаёт pseudonymizer; таблицы замен сбрасываются. Кэш pip `.deps/pip-cache` и Docker-том `model-cache` общие. Первый запуск скачает также веса Qwen; готовность требует обеих моделей. Без ключа и модели OpenAI отправка заблокирована.
+У обоих режимов один сервис и API. GLiNER распознаёт персональные данные, общая локальная Qwen3 1.7B связывает имена и выбирает словоформы. Qwen загружается один раз: FP16 на CUDA, FP32 на CPU. Переключение режима пересоздаёт pseudonymizer; таблицы замен сбрасываются. Docker-том `model-cache` общий и хранит веса GLiNER и Qwen. Без ключа и модели OpenAI отправка заблокирована.
 
-Зависимости устанавливаются при первом старте нового контейнера из `pseudonymizer/requirements.cuda.txt` или `pseudonymizer/requirements.cpu.txt`. Режим и файл зависимостей входят в маркер установленного окружения: при обычном перезапуске того же контейнера установка пропускается. Сборка образа не скачивает пакеты; сервис готов после установки и загрузки модели.
+Тяжёлые зависимости устанавливаются при сборке образа из базового `pseudonymizer/requirements.cuda.txt` либо `pseudonymizer/requirements.cpu.txt`. Docker устанавливает их до копирования кода: правки Python-файлов не пересобирают этот слой. PyTorch ставится отдельно с `--no-deps` из официального индекса `cu128` либо `cpu`, остальные пакеты — с PyPI. У CPU-образа нет зависимостей NVIDIA. Режим работающего сервиса должен совпадать с режимом собранного образа.
 
-PyTorch устанавливается отдельно с `--no-deps` из официального индекса `cu128` либо `cpu`. Остальные зависимости ставятся с PyPI: это избегает NVIDIA-ссылок с запретом HTTP-кеширования. У CPU-сборки PyTorch нет зависимостей NVIDIA; ранее скачанные CUDA-файлы в общем кэше автоматически не удаляются.
+Дополнительный `pseudonymizer/requirements.txt` подключён с диска проекта только для чтения. При старте pip устанавливает недостающие зависимости и проверяет совместимость. Уже установленные подходящие версии остаются на месте. Версии всех базовых пакетов зафиксированы в constraints внутри образа: дополнительный файл не может незаметно заменить PyTorch, CUDA или другие базовые библиотеки.
 
-Кэш pip подключён напрямую с диска проекта и переживает очистку кэша Docker и удаление образов. Pip может обращаться в интернет за метаданными; [кэш pip](https://pip.pypa.io/en/stable/topics/caching/) уменьшает повторные загрузки, но не является установкой без сети. Том модели отдельно: `docker compose down -v` удаляет его.
-
-Подготовка кэша необязательна; выполняется в одноразовом Linux-контейнере без запуска сервиса:
-
-```powershell
-./scripts/prepare-pseudonymizer-dependencies.ps1 -Device cuda
-# Либо CPU:
-./scripts/prepare-pseudonymizer-dependencies.ps1 -Device cpu
-```
+Кэш pip не используется. Пересоздание контейнера из готового образа сохраняет базовые зависимости; пересборка без Docker-кэша скачает их заново. Старый каталог `.deps/pip-cache` больше не подключается. Том с весами моделей остаётся отдельно: `docker compose down -v` удаляет его.
 
 ## Обновление зависимостей
 
-Общие диапазоны обновлений заданы в `pseudonymizer/requirements.in`. Кандидат сохраняется отдельно для выбранного режима, рабочие файлы не меняются:
+Для нового дополнительного пакета добавьте закреплённую версию в `pseudonymizer/requirements.txt`, затем перезапустите сервис:
 
 ```powershell
-./scripts/prepare-pseudonymizer-dependencies.ps1 -Mode Update -Device cuda
-# Для CPU укажите -Device cpu; кандидат будет requirements.updated.cpu.txt.
-git diff --no-index pseudonymizer/requirements.cuda.txt .deps/requirements.updated.cuda.txt
-# После просмотра примените CUDA-кандидат:
-Copy-Item pseudonymizer/requirements.cuda.txt .deps/requirements.previous.cuda.txt
-Copy-Item .deps/requirements.updated.cuda.txt pseudonymizer/requirements.cuda.txt
-docker compose up -d --build --force-recreate pseudonymizer
+docker compose restart pseudonymizer
 ```
 
-Для CPU аналогично используйте файлы с `cpu` и команду `docker compose -f compose.yaml -f compose.cpu.yaml up -d --build --force-recreate pseudonymizer`. Откат: восстановите соответствующий файл зависимостей из `.deps/requirements.previous.<режим>.txt` и пересоздайте сервис. `Update` выполняет `pip check`, но не проверяет реальную модель. Не запускайте подготовку и установку сервиса одновременно с одним кэшем.
+Для изменения базовых версий правьте файл соответствующего режима и пересоберите образ:
+
+```powershell
+# CUDA:
+docker compose up -d --build pseudonymizer
+# CPU:
+docker compose -f compose.yaml -f compose.cpu.yaml up -d --build pseudonymizer
+```
+
+Дополнительные зависимости, установленные при старте, сохраняются при перезапуске того же контейнера и повторно устанавливаются при его пересоздании. Удаление строки из дополнительного файла не удаляет уже установленный пакет; для чистого окружения пересоздайте контейнер. Скрипты подготовки кэша больше не нужны и удалены.
 
 ## Проверка запуска
 

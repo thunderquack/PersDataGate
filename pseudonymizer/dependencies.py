@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.metadata
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -16,7 +15,6 @@ TORCH_INDEXES = {
     "cuda": "https://download.pytorch.org/whl/cu128",
 }
 PYPI_INDEX = "https://pypi.org/simple"
-PIP_CACHE = os.environ.get("PIP_CACHE_DIR", "/pip-cache")
 TORCH_LINE = re.compile(r"^\s*torch(?:\[[^]]+\])?\s*(?P<spec>[<>=!~].*)$", re.IGNORECASE)
 INDEX_LINE = re.compile(r"^\s*--(?:extra-)?index-url(?:\s|=)|^\s*--find-links(?:\s|=)", re.IGNORECASE)
 
@@ -28,8 +26,7 @@ def _pip(*args: str) -> None:
             "-m",
             "pip",
             "--disable-pip-version-check",
-            "--cache-dir",
-            PIP_CACHE,
+            "--no-cache-dir",
             *args,
         ],
         check=True,
@@ -84,3 +81,34 @@ def install_dependencies(requirements: Path, device: str = "cuda", upgrade: bool
         _pip(*args)
 
     return torch_version
+
+
+def install_runtime_dependencies(requirements: Path, constraints: Path) -> None:
+    """Install optional lightweight additions while pinning the image baseline."""
+    active_requirements = [
+        line.strip()
+        for line in requirements.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not active_requirements:
+        return
+    _pip(
+        "install",
+        "--only-binary=:all:",
+        "--index-url",
+        PYPI_INDEX,
+        "-r",
+        str(requirements),
+        "-c",
+        str(constraints),
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", choices=tuple(TORCH_INDEXES), required=True)
+    parser.add_argument("--requirements", type=Path, required=True)
+    args = parser.parse_args()
+    install_dependencies(args.requirements, device=args.device)

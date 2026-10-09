@@ -1,5 +1,9 @@
 services:
   pseudonymizer:
+    image: persdatagate-pseudonymizer:cpu
+    build:
+      args:
+        DEVICE: cpu
     gpus: !reset []
     environment:
       DEVICE: cpu

@@ -46,7 +46,7 @@ function showRows(id, rows, columns, emptyMessage, unavailableMessage) {
 
 function showSteps(result) {
   const steps = result.steps || {};
-  const sources = {gliner: "GLiNER", rule: "Правило"};
+  const sources = {gliner: "GLiNER 2.5", rule: "Правило"};
   const statuses = {restored: "Восстановлено", uncertain: "Неуверенно — маркер сохранён", unknown: "Неизвестный маркер"};
   const reasons = {
     recipient_address: "Поле имени в немецком адресном блоке",

@@ -83,6 +83,14 @@ def test_declined_name_and_initial_link_globally_and_expand_to_full_name():
     assert record.canonical == "Иван Петров"
     assert set(record.aliases) == {"Иван Петров", "Ивана Петрова", "И. Петров"}
     assert generator.link_calls  # distant mentions are still compared globally
+    link_payload = generator.link_calls[0]
+    assert link_payload["document"] == text
+    left = link_payload["left"]
+    right = link_payload["right"]
+    assert text[left["start"]:left["end"]] == left["mention"]
+    assert text[right["start"]:right["end"]] == right["mention"]
+    assert "before" not in left and "after" not in left
+    assert "before" not in right and "after" not in right
 
 
 def test_ambiguous_initial_is_kept_separate_from_two_possible_people():

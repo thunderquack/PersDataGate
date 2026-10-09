@@ -7,8 +7,9 @@ import types
 import pytest
 
 from pseudonymizer.local_llm import (
+    ContextLimitError,
+    DEFAULT_CONTEXT_WINDOW,
     MAX_NEW_TOKENS,
-    MAX_TOTAL_TOKENS,
     MODEL_ID,
     MODEL_REVISION,
     GenerationError,
@@ -34,11 +35,15 @@ class FakeBatch:
         return FakeTensor(1)
 
 
-def mocked_transformers(monkeypatch, *, response: str, input_tokens: int = 8):
+def mocked_transformers(monkeypatch, *, response: str, input_tokens: int = 8,
+                        model_context: int = DEFAULT_CONTEXT_WINDOW,
+                        tokenizer_limit: int = 10**30):
     calls = {"tokenizer_load": [], "model_load": [], "template": [], "encoded": [], "generate": []}
     input_ids = FakeTensor(input_tokens)
 
     class Tokenizer:
+        model_max_length = tokenizer_limit
+
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
             calls["tokenizer_load"].append((args, kwargs))
@@ -62,6 +67,8 @@ def mocked_transformers(monkeypatch, *, response: str, input_tokens: int = 8):
             return response
 
     class Model:
+        config = types.SimpleNamespace(max_position_embeddings=model_context)
+
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
             calls["model_load"].append((args, kwargs))
@@ -116,22 +123,59 @@ def test_loads_pinned_model_on_selected_device_and_uses_nonthinking_chat_templat
     assert calls["eval"] is True
     assert calls["template"][0][1]["enable_thinking"] is False
     assert calls["generate"][0]["max_new_tokens"] == MAX_NEW_TOKENS
+    assert calls["generate"][0]["logits_to_keep"] == 1
     assert calls["generate"][0]["do_sample"] is False
     assert calls["inference_entered"] is True
+    assert generator.context_window == DEFAULT_CONTEXT_WINDOW
+    assert generator.input_budget == DEFAULT_CONTEXT_WINDOW - MAX_NEW_TOKENS
 
 
-def test_does_not_truncate_or_generate_when_encoded_prompt_exceeds_budget(monkeypatch, tmp_path):
+def test_does_not_truncate_or_generate_when_encoded_prompt_exceeds_model_context(monkeypatch, tmp_path):
+    events = []
+    monkeypatch.setattr("pseudonymizer.local_llm.event", lambda name, data: events.append((name, data)))
     calls = mocked_transformers(
         monkeypatch,
         response='{"relation":"same"}',
-        input_tokens=MAX_TOTAL_TOKENS - MAX_NEW_TOKENS + 1,
+        input_tokens=4096 - MAX_NEW_TOKENS + 1,
+        model_context=4096,
+        tokenizer_limit=128,
     )
     generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
 
-    with pytest.raises(GenerationError, match="maximum is 7936 input tokens"):
+    with pytest.raises(ContextLimitError, match="maximum is 3840 input tokens") as error:
         generator.choose("instructions", {"large": "payload"})
+    assert error.value.input_tokens == 3841
+    assert error.value.maximum_input_tokens == 3840
+    assert error.value.context_window == 4096
     assert calls["generate"] == []
     assert calls["encoded"][0][1].get("truncation") is None
+    error_event = next(data for name, data in events
+                       if name == "llm.error" and data["phase"] == "input_limit")
+    assert error_event["rendered_prompt"] == "rendered prompt"
+    assert error_event["context_window"] == 4096
+    assert error_event["input_budget"] == 4096 - MAX_NEW_TOKENS
+
+
+def test_rejects_invalid_model_context_window(monkeypatch, tmp_path):
+    mocked_transformers(
+        monkeypatch, response='{"relation":"same"}', model_context=0
+    )
+
+    with pytest.raises(ValueError, match="positive integer"):
+        QwenGenerator(device="cpu", cache_dir=tmp_path)
+
+
+def test_input_exactly_at_model_budget_is_allowed(monkeypatch, tmp_path):
+    calls = mocked_transformers(
+        monkeypatch,
+        response='{"relation":"same"}',
+        input_tokens=4096 - MAX_NEW_TOKENS,
+        model_context=4096,
+    )
+    generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
+
+    assert generator.choose("instructions", {"id": "p1"}) == {"relation": "same"}
+    assert len(calls["generate"]) == 1
 
 
 @pytest.mark.parametrize(

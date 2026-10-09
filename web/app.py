@@ -35,10 +35,13 @@ class ProcessRequest(BaseModel):
 
 class ApiError(Exception):
     def __init__(self, stage: str, code: str, message: str, *, prepared: str = "", received: str = "",
-                 sent_request: dict[str, Any] | None = None):
+                 sent_request: dict[str, Any] | None = None, status_code: int | None = None,
+                 details: dict[str, int] | None = None):
         self.stage, self.code, self.message = stage, code, message
         self.prepared, self.received = prepared, received
         self.sent_request = sent_request
+        self.status_code = status_code or (503 if stage == "configuration" else 502)
+        self.details = details or {}
 
 
 class PseudonymizerClient:
@@ -94,8 +97,8 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
 
     @app.exception_handler(ApiError)
     async def api_error_handler(request: Request, exc: ApiError):
-        return JSONResponse(status_code=503 if exc.stage == "configuration" else 502, content={
-            "error": {"stage": exc.stage, "code": exc.code, "message": exc.message},
+        return JSONResponse(status_code=exc.status_code, content={
+            "error": {"stage": exc.stage, "code": exc.code, "message": exc.message, **exc.details},
             "prepared_text": exc.prepared, "received_text": exc.received,
             "sent_request": exc.sent_request,
             "steps": getattr(request.state, "processing_steps", {}),
@@ -137,6 +140,31 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
             request.state.processing_warnings = anonymized.get("warnings", [])
         except PipelineLogError:
             raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 413:
+                try:
+                    detail = exc.response.json().get("detail", {})
+                except (ValueError, AttributeError):
+                    detail = {}
+                if isinstance(detail, dict) and detail.get("code") == "local_model_context_exceeded":
+                    values = {
+                        key: detail.get(key)
+                        for key in ("input_tokens", "maximum_input_tokens", "context_window")
+                    }
+                    if all(isinstance(value, int) and not isinstance(value, bool)
+                           for value in values.values()):
+                        message = (
+                            "Документ и промпт превышают контекст локальной модели: "
+                            f"{values['input_tokens']} токенов при лимите ввода "
+                            f"{values['maximum_input_tokens']} (окно контекста "
+                            f"{values['context_window']}). Запрос в OpenAI не отправлен."
+                        )
+                        raise ApiError(
+                            "anonymize", "local_model_context_exceeded", message,
+                            status_code=413, details=values,
+                        ) from None
+            raise ApiError("anonymize", "pseudonymizer_unavailable",
+                           "Не удалось псевдонимизировать текст. Запрос в OpenAI не отправлен.") from None
         except Exception:
             raise ApiError("anonymize", "pseudonymizer_unavailable",
                            "Не удалось псевдонимизировать текст. Запрос в OpenAI не отправлен.") from None

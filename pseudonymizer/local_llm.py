@@ -12,7 +12,7 @@ from common.pipeline_log import event
 
 MODEL_ID = "Qwen/Qwen3-1.7B"
 MODEL_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
-MAX_TOTAL_TOKENS = 8192
+DEFAULT_CONTEXT_WINDOW = 40960
 MAX_NEW_TOKENS = 256
 
 # Generation is serialized because one model instance is shared by the API's
@@ -22,6 +22,20 @@ _GENERATION_LOCK = threading.Lock()
 
 class GenerationError(RuntimeError):
     """Safe, bounded error from model input validation or generation."""
+
+
+class ContextLimitError(GenerationError):
+    """The rendered prompt exceeds the model's configured context window."""
+
+    def __init__(self, input_tokens: int, maximum_input_tokens: int,
+                 context_window: int):
+        self.input_tokens = input_tokens
+        self.maximum_input_tokens = maximum_input_tokens
+        self.context_window = context_window
+        super().__init__(
+            f"Model input is too large ({input_tokens} tokens); maximum is "
+            f"{maximum_input_tokens} input tokens for a {context_window}-token context window"
+        )
 
 
 def _finite_choices(payload: Any) -> list[dict[str, Any]] | None:
@@ -113,6 +127,18 @@ class QwenGenerator:
         )
         self.model.to(device)
         self.model.eval()
+        context_window = getattr(
+            getattr(self.model, "config", None),
+            "max_position_embeddings",
+            DEFAULT_CONTEXT_WINDOW,
+        )
+        if (not isinstance(context_window, int) or isinstance(context_window, bool)
+                or context_window <= MAX_NEW_TOKENS):
+            raise ValueError(
+                "Model max_position_embeddings must be an integer larger than the output budget"
+            )
+        self.context_window = context_window
+        self.input_budget = self.context_window - MAX_NEW_TOKENS
         self._torch = torch
 
     def choose(self, system: str, payload: Any) -> dict[str, Any]:
@@ -122,13 +148,17 @@ class QwenGenerator:
             "revision": MODEL_REVISION,
             "system": system,
             "payload": payload,
+            "context_window": self.context_window,
+            "input_budget": self.input_budget,
         })
         if not isinstance(system, str):
             raise GenerationError("Model instructions must be text")
         try:
             payload_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError) as exc:
-            event("llm.error", {"type": type(exc).__name__, "phase": "serialize_payload"})
+            event("llm.error", {"type": type(exc).__name__, "phase": "serialize_payload",
+                                 "context_window": self.context_window,
+                                 "input_budget": self.input_budget})
             raise GenerationError("Model input must be JSON-serializable") from exc
 
         messages = [
@@ -150,10 +180,27 @@ class QwenGenerator:
                 add_generation_prompt=True,
                 enable_thinking=False,
             )
+        except Exception as exc:
+            event("llm.error", {"type": type(exc).__name__, "phase": "render_prompt",
+                                 "system": system, "payload": payload,
+                                 "context_window": self.context_window,
+                                 "input_budget": self.input_budget})
+            raise GenerationError("Could not render model input") from exc
+        event("llm.input", {
+            "model": MODEL_ID,
+            "revision": MODEL_REVISION,
+            "rendered_prompt": rendered,
+            "context_window": self.context_window,
+            "input_budget": self.input_budget,
+        })
+        try:
             encoded = self.tokenizer(rendered, return_tensors="pt", add_special_tokens=False)
             input_ids = encoded["input_ids"]
         except Exception as exc:
-            event("llm.error", {"type": type(exc).__name__, "phase": "encode_input"})
+            event("llm.error", {"type": type(exc).__name__, "phase": "encode_input",
+                                 "rendered_prompt": rendered,
+                                 "context_window": self.context_window,
+                                 "input_budget": self.input_budget})
             raise GenerationError("Could not encode model input") from exc
 
         input_tokens = int(input_ids.shape[-1])
@@ -162,19 +209,20 @@ class QwenGenerator:
             "revision": MODEL_REVISION,
             "rendered_prompt": rendered,
             "input_tokens": input_tokens,
+            "context_window": self.context_window,
+            "input_budget": self.input_budget,
         })
-        input_budget = MAX_TOTAL_TOKENS - MAX_NEW_TOKENS
-        if input_tokens > input_budget:
+        if input_tokens > self.input_budget:
             event("llm.error", {
-                "type": "GenerationError",
+                "type": "ContextLimitError",
                 "phase": "input_limit",
                 "input_tokens": input_tokens,
-                "maximum_input_tokens": input_budget,
+                "maximum_input_tokens": self.input_budget,
+                "context_window": self.context_window,
+                "input_budget": self.input_budget,
+                "rendered_prompt": rendered,
             })
-            raise GenerationError(
-                f"Model input is too large ({input_tokens} tokens); maximum is "
-                f"{input_budget} input tokens"
-            )
+            raise ContextLimitError(input_tokens, self.input_budget, self.context_window)
 
         model_inputs = {key: value.to(self.device) for key, value in encoded.items()}
         try:
@@ -193,12 +241,16 @@ class QwenGenerator:
                     **model_inputs,
                     max_new_tokens=MAX_NEW_TOKENS,
                     do_sample=False,
+                    logits_to_keep=1,
                     **generation_options,
                 )
             completion_ids = output[0, input_ids.shape[-1] :]
             completion = self.tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         except Exception as exc:
-            event("llm.error", {"type": type(exc).__name__, "phase": "generation"})
+            event("llm.error", {"type": type(exc).__name__, "phase": "generation",
+                                 "rendered_prompt": rendered,
+                                 "context_window": self.context_window,
+                                 "input_budget": self.input_budget})
             raise GenerationError("Local model generation failed") from exc
 
         event("llm.output", {
@@ -211,11 +263,16 @@ class QwenGenerator:
             result = json.loads(completion, object_pairs_hook=_unique_object)
         except (json.JSONDecodeError, ValueError) as exc:
             event("llm.error", {"type": type(exc).__name__, "phase": "parse_json",
-                                 "raw_completion": completion})
+                                 "raw_completion": completion,
+                                 "rendered_prompt": rendered,
+                                 "context_window": self.context_window,
+                                 "input_budget": self.input_budget})
             raise GenerationError("Local model did not return a strict JSON object") from exc
         if not isinstance(result, dict):
             event("llm.error", {"type": "GenerationError", "phase": "validate_json",
-                                 "parsed": result})
+                                 "parsed": result, "rendered_prompt": rendered,
+                                 "context_window": self.context_window,
+                                 "input_budget": self.input_budget})
             raise GenerationError("Local model response must be a JSON object")
         event("llm.output", {"parsed": result})
         return result

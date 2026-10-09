@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from common.pipeline_log import PipelineLogError, event, install_pipeline_logging
 from .config import get_device
+from .local_llm import ContextLimitError
 from .service import MAX_TEXT_LENGTH, MappingStore, anonymize_text, expires_iso, restore_text
 
 MAX_RESPONSE_LENGTH = 3_000_000
@@ -123,6 +124,18 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
                 )
         except PipelineLogError:
             raise
+        except ContextLimitError as exc:
+            event("anonymization.context_limit", {
+                "input_tokens": exc.input_tokens,
+                "maximum_input_tokens": exc.maximum_input_tokens,
+                "context_window": exc.context_window,
+            })
+            raise HTTPException(status_code=413, detail={
+                "code": "local_model_context_exceeded",
+                "input_tokens": exc.input_tokens,
+                "maximum_input_tokens": exc.maximum_input_tokens,
+                "context_window": exc.context_window,
+            }) from None
         except Exception as exc:
             event("anonymization.error", {"type": type(exc).__name__})
             logger.error("Anonymization failed (%s)", type(exc).__name__)

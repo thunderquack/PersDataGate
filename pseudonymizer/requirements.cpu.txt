@@ -1,7 +1,8 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
 pydantic==2.11.4
-gliner==0.2.21
+gliner2[local]==2.0.0
+peft==0.15.2
 transformers==4.51.3
 huggingface-hub==0.30.2
 tokenizers==0.21.1

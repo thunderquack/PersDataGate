@@ -12,10 +12,10 @@ from pseudonymizer.config import get_device
 
 
 def _fake_model(monkeypatch, *, cuda_available: bool):
-    calls = {"cuda_checks": 0, "to": [], "eval": 0}
+    calls = {"cuda_checks": 0, "to": [], "eval": 0, "loads": []}
 
     class FakeModel:
-        data_processor = types.SimpleNamespace(transformer_tokenizer=object())
+        processor = types.SimpleNamespace(tokenizer=object())
 
         def to(self, device):
             calls["to"].append(device)
@@ -43,8 +43,12 @@ def _fake_model(monkeypatch, *, cuda_available: bool):
 
     torch.inference_mode = InferenceMode
 
-    gliner = types.ModuleType("gliner")
-    gliner.GLiNER = types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: model)
+    def from_pretrained(*args, **kwargs):
+        calls["loads"].append((args, kwargs))
+        return model
+
+    gliner2 = types.ModuleType("gliner2")
+    gliner2.AutoExtractor = types.SimpleNamespace(from_pretrained=from_pretrained)
     hub = types.ModuleType("huggingface_hub")
     hub.snapshot_download = lambda **kwargs: "/fake/model-snapshot"
     from pseudonymizer.local_llm import QwenGenerator
@@ -58,7 +62,7 @@ def _fake_model(monkeypatch, *, cuda_available: bool):
     persons.PersonPipeline = lambda generator: types.SimpleNamespace(generator=generator)
     monkeypatch.setitem(sys.modules, "pseudonymizer.persons", persons)
     monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setitem(sys.modules, "gliner", gliner)
+    monkeypatch.setitem(sys.modules, "gliner2", gliner2)
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     return calls
 
@@ -83,8 +87,9 @@ def test_cpu_startup_skips_cuda_probe_and_reports_device(monkeypatch):
     with TestClient(create_app()) as client:
         assert client.get("/health/ready").json() == {"ready": True, "device": "cpu"}
     assert calls == {
-        "cuda_checks": 0, "to": ["cpu"], "eval": 1,
+        "cuda_checks": 0, "to": [], "eval": 1,
         "generator": ("cpu", "/fake/cache"),
+        "loads": [(('/fake/model-snapshot',), {"map_location": "cpu"})],
     }
 
 
@@ -98,8 +103,9 @@ def test_cuda_startup_uses_cuda_and_reports_device(monkeypatch):
     with TestClient(create_app()) as client:
         assert client.get("/health/ready").json() == {"ready": True, "device": "cuda"}
     assert calls == {
-        "cuda_checks": 1, "to": ["cuda"], "eval": 1,
+        "cuda_checks": 1, "to": [], "eval": 1,
         "generator": ("cuda", "/fake/cache"),
+        "loads": [(('/fake/model-snapshot',), {"map_location": "cuda"})],
     }
 
 
@@ -112,7 +118,7 @@ def test_cuda_startup_fails_when_gpu_is_unavailable(monkeypatch):
     with pytest.raises(RuntimeError, match="CUDA GPU is required"):
         with TestClient(create_app()):
             pass
-    assert calls == {"cuda_checks": 1, "to": [], "eval": 0}
+    assert calls == {"cuda_checks": 1, "to": [], "eval": 0, "loads": []}
 
 
 def test_invalid_device_fails_before_loading_model(monkeypatch):

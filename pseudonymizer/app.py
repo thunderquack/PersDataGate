@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -15,8 +16,8 @@ from .local_llm import ContextLimitError
 from .service import MAX_TEXT_LENGTH, MappingStore, anonymize_text, expires_iso, restore_text
 
 MAX_RESPONSE_LENGTH = 3_000_000
-GLINER_MODEL_ID = "urchade/gliner_multi-v2.1"
-GLINER_REVISION = "443d26d654e0324125a96bebd8e796c14ff2efe6"
+GLINER_MODEL_ID = "fastino/gliner2.5-multi-v1"
+GLINER_REVISION = "cf5593a5d45e3bbf204b9df621b13b1c0cf25ee3"
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -32,19 +33,69 @@ class DeanonymizeRequest(BaseModel):
     include_steps: bool = False
 
 
-class GLiNERDetector:
+class GLiNER2Detector:
     def __init__(self, model: Any, inference_mode: Any,
                  model_id: str = GLINER_MODEL_ID, revision: str = GLINER_REVISION):
         self.model = model
-        self.tokenizer = model.data_processor.transformer_tokenizer
+        self.tokenizer = model.processor.tokenizer
         self.lock = threading.Lock()
         self.inference_mode = inference_mode
         self.model_id = model_id
         self.model_revision = revision
 
-    def predict_entities(self, *args: Any, **kwargs: Any) -> Any:
+    def predict_entities(self, text: str, labels: list[str], threshold: float) -> list[dict[str, Any]]:
         with self.lock, self.inference_mode():
-            return self.model.predict_entities(*args, **kwargs)
+            response = self.model.extract_entities(
+                text,
+                labels,
+                threshold=threshold,
+                include_confidence=True,
+                include_spans=True,
+            )
+        if not isinstance(response, dict) or not isinstance(response.get("entities"), dict):
+            raise ValueError("GLiNER2 returned an invalid entity response")
+
+        predictions: list[dict[str, Any]] = []
+        entities = response["entities"]
+        for label in labels:
+            rows = entities.get(label, [])
+            if not isinstance(rows, list):
+                raise ValueError("GLiNER2 returned an invalid entity list")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("GLiNER2 returned a malformed entity")
+                value = row.get("text")
+                start, end = row.get("start"), row.get("end")
+                score = row.get("confidence")
+                try:
+                    normalized_score = float(score)
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError("GLiNER2 returned a malformed entity") from None
+                if (
+                    not isinstance(value, str)
+                    or not value
+                    or not isinstance(start, int)
+                    or isinstance(start, bool)
+                    or not isinstance(end, int)
+                    or isinstance(end, bool)
+                    or start < 0
+                    or end <= start
+                    or end > len(text)
+                    or text[start:end] != value
+                    or not isinstance(score, (int, float))
+                    or isinstance(score, bool)
+                    or not math.isfinite(normalized_score)
+                    or not 0.0 <= normalized_score <= 1.0
+                ):
+                    raise ValueError("GLiNER2 returned a malformed entity")
+                predictions.append({
+                    "text": value,
+                    "label": label,
+                    "start": start,
+                    "end": end,
+                    "score": normalized_score,
+                })
+        return predictions
 
 
 def create_app(detector: Any | None = None, store: MappingStore | None = None,
@@ -52,14 +103,14 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         device = get_device()
-        logger.info("Initializing GLiNER on %s", device)
+        logger.info("Initializing GLiNER2.5 on %s", device)
         if detector is not None:
             app.state.detector = detector
             app.state.pipeline = pipeline
         else:
             try:
                 import torch
-                from gliner import GLiNER
+                from gliner2 import AutoExtractor
                 from huggingface_hub import snapshot_download
 
                 if device == "cuda" and not torch.cuda.is_available():
@@ -69,16 +120,20 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
                     repo_id=GLINER_MODEL_ID,
                     revision=GLINER_REVISION,
                     cache_dir=cache_dir,
-                    allow_patterns=["gliner_config.json", "model.safetensors"],
+                    allow_patterns=[
+                        "config.json",
+                        "encoder_config/config.json",
+                        "model.safetensors",
+                        "tokenizer.json",
+                        "tokenizer_config.json",
+                    ],
                 )
-                model = GLiNER.from_pretrained(
+                model = AutoExtractor.from_pretrained(
                     model_snapshot,
-                    max_length=384,
-                    cache_dir=cache_dir,
+                    map_location=device,
                 )
-                model.to(device)
                 model.eval()
-                app.state.detector = GLiNERDetector(
+                app.state.detector = GLiNER2Detector(
                     model, torch.inference_mode, GLINER_MODEL_ID, GLINER_REVISION
                 )
                 if pipeline is None:

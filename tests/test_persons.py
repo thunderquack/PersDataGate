@@ -91,6 +91,37 @@ def test_declined_name_and_initial_link_globally_and_expand_to_full_name():
     assert text[right["start"]:right["end"]] == right["mention"]
     assert "before" not in left and "after" not in left
     assert "before" not in right and "after" not in right
+    assert all(len(call["left"]["mention"]) >= len(call["right"]["mention"])
+               for call in generator.link_calls)
+
+
+def test_short_earlier_mention_is_swapped_after_the_fuller_spelling():
+    text = "A. Smith was first mentioned. Later, Alexander Smith replied."
+    spans = person_spans(text, "A. Smith", "Alexander Smith")
+    generator = ScriptedGenerator(link="same")
+
+    PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
+
+    payload = generator.link_calls[0]
+    assert payload["left"]["mention"] == "Alexander Smith"
+    assert payload["left"]["start"] == text.index("Alexander Smith")
+    assert payload["right"]["mention"] == "A. Smith"
+    assert payload["right"]["start"] == text.index("A. Smith")
+    assert text[payload["left"]["start"]:payload["left"]["end"]] == "Alexander Smith"
+    assert text[payload["right"]["start"]:payload["right"]["end"]] == "A. Smith"
+
+
+def test_equal_length_pair_preserves_original_order():
+    text = "John Smith, then John Smith"
+    spans = person_spans(text, "John Smith", "John Smith")
+    generator = ScriptedGenerator(link="same")
+
+    PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
+
+    payload = generator.link_calls[0]
+    assert len(payload["left"]["mention"]) == len(payload["right"]["mention"])
+    assert payload["left"]["start"] == spans[0].start
+    assert payload["right"]["start"] == spans[1].start
 
 
 def test_ambiguous_initial_is_kept_separate_from_two_possible_people():

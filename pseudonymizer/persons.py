@@ -358,6 +358,10 @@ class PersonPipeline:
 
         def decide(i: int, j: int) -> str:
             left, right = mentions[i], mentions[j]
+            # Give the model the fuller spelling first. This is presentation
+            # order only; graph indices and source offsets remain unchanged.
+            if len(left.value) < len(right.value):
+                left, right = right, left
             payload = {
                 "document": text,
                 "left": {

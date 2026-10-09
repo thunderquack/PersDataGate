@@ -11,6 +11,7 @@ from pseudonymizer.local_llm import (
     DEFAULT_CONTEXT_WINDOW,
     MAX_NEW_TOKENS,
     MODEL_ID,
+    MODEL_REGISTRY,
     MODEL_REVISION,
     GenerationError,
     QwenGenerator,
@@ -109,6 +110,7 @@ def mocked_transformers(monkeypatch, *, response: str, input_tokens: int = 8,
 def test_loads_pinned_model_on_selected_device_and_uses_nonthinking_chat_template(
     monkeypatch, tmp_path, device, dtype
 ):
+    monkeypatch.delenv("LOCAL_LLM_MODEL", raising=False)
     calls = mocked_transformers(monkeypatch, response='{"relation":"same"}')
     generator = QwenGenerator(device=device, cache_dir=tmp_path)
 
@@ -128,6 +130,47 @@ def test_loads_pinned_model_on_selected_device_and_uses_nonthinking_chat_templat
     assert calls["inference_entered"] is True
     assert generator.context_window == DEFAULT_CONTEXT_WINDOW
     assert generator.input_budget == DEFAULT_CONTEXT_WINDOW - MAX_NEW_TOKENS
+
+
+def test_selects_4b_model_from_environment_and_logs_its_pinned_metadata(monkeypatch, tmp_path):
+    events = []
+    monkeypatch.setattr("pseudonymizer.local_llm.event", lambda name, data: events.append((name, data)))
+    monkeypatch.setenv("LOCAL_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+    calls = mocked_transformers(
+        monkeypatch, response='{"relation":"same"}', model_context=262144
+    )
+    generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
+
+    assert calls["tokenizer_load"][0] == (
+        ("Qwen/Qwen3-4B-Instruct-2507",),
+        {"revision": "cdbee75f17c01a7cc42f958dc650907174af0554", "cache_dir": str(tmp_path)},
+    )
+    assert calls["model_load"][0][0] == ("Qwen/Qwen3-4B-Instruct-2507",)
+    assert calls["model_load"][0][1]["revision"] == "cdbee75f17c01a7cc42f958dc650907174af0554"
+    assert generator.context_window == 262144
+    assert generator.input_budget == 262144 - MAX_NEW_TOKENS
+    assert generator.choose("Choose relation", {"allowed_relations": ["same"]}) == {
+        "relation": "same"
+    }
+    llm_events = [(name, data) for name, data in events if name.startswith("llm.")]
+    assert llm_events
+    assert all(data["model"] == "Qwen/Qwen3-4B-Instruct-2507" for _, data in llm_events)
+    assert all(data["revision"] == "cdbee75f17c01a7cc42f958dc650907174af0554"
+               for _, data in llm_events)
+
+
+def test_rejects_unknown_model_from_environment_before_heavy_imports(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCAL_LLM_MODEL", "Qwen/not-registered")
+    original_import = __import__
+
+    def reject_heavy_import(name, *args, **kwargs):
+        if name in {"torch", "transformers"}:
+            raise AssertionError(f"Unexpected heavy import: {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", reject_heavy_import)
+    with pytest.raises(ValueError, match="Unsupported LOCAL_LLM_MODEL"):
+        QwenGenerator(device="cpu", cache_dir=tmp_path)
 
 
 def test_does_not_truncate_or_generate_when_encoded_prompt_exceeds_model_context(monkeypatch, tmp_path):

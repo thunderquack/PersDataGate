@@ -95,6 +95,52 @@ def test_format_rule_wins_over_overlapping_model_span():
     assert next(iter(mapping)).startswith("⟦EMAIL_")
 
 
+def test_person_and_other_entity_confidence_thresholds(monkeypatch):
+    import math
+    from pseudonymizer.service import (
+        ACCEPTED_THRESHOLDS, LABELS, MODEL_INFERENCE_THRESHOLD, find_spans,
+    )
+
+    source = (
+        "Irene Wirth; I. Wirth; Low Address; High Address; Low DOB; High DOB; "
+        "Low Person; Invalid Score"
+    )
+    predictions = [
+        entity("Irene Wirth", "person", source, score=0.145),
+        entity("I. Wirth", "person", source, score=0.145),
+        entity("Low Address", "street address", source, score=0.44),
+        entity("High Address", "street address", source, score=0.45),
+        entity("Low DOB", "date of birth", source, score=0.44),
+        entity("High DOB", "date of birth", source, score=0.45),
+        entity("Low Person", "person", source, score=0.099),
+        entity("Invalid Score", "person", source, score=math.nan),
+    ]
+    detector = FakeDetector({source: predictions})
+    events = []
+    monkeypatch.setattr("pseudonymizer.service.event", lambda name, data: events.append((name, data)))
+
+    spans = find_spans(source, detector)
+
+    assert [span.value for span in spans] == [
+        "Irene Wirth", "I. Wirth", "High Address", "High DOB"
+    ]
+    assert detector.calls == [(source, LABELS, MODEL_INFERENCE_THRESHOLD)]
+    assert "person" in detector.calls[0][1]
+    assert "person name" not in detector.calls[0][1]
+    chunk_log = next(data for name, data in events if name == "ner.chunk")
+    assert chunk_log["threshold"] == 0.10
+    assert chunk_log["accepted_thresholds"] == ACCEPTED_THRESHOLDS
+    rejected = chunk_log["rejected_low_confidence"]
+    assert {(item["value"], item["threshold"], item["reason"]) for item in rejected} == {
+        ("Low Address", 0.45, "low_confidence"),
+        ("Low DOB", 0.45, "low_confidence"),
+        ("Low Person", 0.10, "low_confidence"),
+        ("Invalid Score", 0.10, "non_finite_score"),
+    }
+    assert all(item["score"] is None or math.isfinite(item["score"])
+               for item in chunk_log["returned_entities"])
+
+
 def test_long_text_is_chunked_with_overlap_and_preserves_global_spans():
     lead = "x" * 690
     source = lead + " Иван Петров " + "y" * 700

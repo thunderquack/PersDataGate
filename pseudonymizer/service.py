@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import threading
 import time
@@ -14,9 +15,22 @@ CHUNK_SIZE = 700
 CHUNK_OVERLAP = 120
 MAX_TEXT_LENGTH = 50_000
 LABELS = [
-    "person name", "street address", "date of birth", "passport number",
+    "person", "street address", "date of birth", "passport number",
     "identity document number", "bank account number",
 ]
+MODEL_INFERENCE_THRESHOLD = 0.10
+PERSON_THRESHOLD = 0.10
+OTHER_ENTITY_THRESHOLD = 0.45
+ACCEPTED_THRESHOLDS = {
+    "PERSON": PERSON_THRESHOLD,
+    "ADDRESS": OTHER_ENTITY_THRESHOLD,
+    "DOB": OTHER_ENTITY_THRESHOLD,
+    "PASSPORT": OTHER_ENTITY_THRESHOLD,
+    "ID": OTHER_ENTITY_THRESHOLD,
+    "BANK_ACCOUNT": OTHER_ENTITY_THRESHOLD,
+    "EMAIL": OTHER_ENTITY_THRESHOLD,
+    "PHONE": OTHER_ENTITY_THRESHOLD,
+}
 
 # Format based detectors have precedence over model spans.
 PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -210,38 +224,74 @@ def find_spans(text: str, model: Any) -> list[Span]:
     model_revision = getattr(model, "model_revision", None)
     for chunk_index, (start, chunk) in enumerate(_chunks(text, getattr(model, "tokenizer", None))):
         try:
-            predictions = model.predict_entities(chunk, LABELS, threshold=0.45)
+            predictions = model.predict_entities(
+                chunk, LABELS, threshold=MODEL_INFERENCE_THRESHOLD
+            )
         except Exception as exc:
             event("ner.error", {
                 "chunk_index": chunk_index, "chunk_offset": start,
                 "chunk_text": chunk, "model": model_id,
                 "revision": model_revision, "error_type": type(exc).__name__,
+                "threshold": MODEL_INFERENCE_THRESHOLD,
+                "accepted_thresholds": ACCEPTED_THRESHOLDS,
             })
             raise
-        event("ner.chunk", {
-            "chunk_index": chunk_index,
-            "chunk_offset": start,
-            "chunk_text": chunk,
-            "labels": LABELS,
-            "threshold": 0.45,
-            "model": model_id,
-            "revision": model_revision,
-            "returned_entities": predictions,
-        })
+        rejected_low_confidence: list[dict[str, Any]] = []
+        logged_predictions: list[dict[str, Any]] = []
         for item in predictions:
+            if not isinstance(item, dict):
+                continue
             value = item.get("text", "")
             local_start = item.get("start")
             local_end = item.get("end")
             if not value or not isinstance(local_start, int) or not isinstance(local_end, int):
                 continue
             code = LABEL_CODES.get(str(item.get("label", "")).lower())
+            raw_score = item.get("score", 0)
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError, OverflowError):
+                score = math.nan
+            score_is_finite = math.isfinite(score)
+            logged_predictions.append({
+                "text": value,
+                "label": item.get("label"),
+                "start": local_start,
+                "end": local_end,
+                "score": score if score_is_finite else None,
+            })
             if code and 0 <= local_start < local_end <= len(chunk):
                 entity_start, entity_end = start + local_start, start + local_end
+                threshold = ACCEPTED_THRESHOLDS[code]
+                if not score_is_finite or score < threshold:
+                    rejected_low_confidence.append({
+                        "value": value,
+                        "label": item.get("label"),
+                        "code": code,
+                        "start": entity_start,
+                        "end": entity_end,
+                        "score": score if score_is_finite else None,
+                        "threshold": threshold,
+                        "reason": "low_confidence" if score_is_finite else "non_finite_score",
+                    })
+                    continue
                 entity_text = text[entity_start:entity_end]
                 if entity_text.strip().casefold() in LABEL_CODES:
                     continue
-                span = Span(entity_start, entity_end, entity_text, code, float(item.get("score", 0)))
+                span = Span(entity_start, entity_end, entity_text, code, score)
                 spans.append(_expand_contextual_address(text, span))
+        event("ner.chunk", {
+            "chunk_index": chunk_index,
+            "chunk_offset": start,
+            "chunk_text": chunk,
+            "labels": LABELS,
+            "threshold": MODEL_INFERENCE_THRESHOLD,
+            "accepted_thresholds": ACCEPTED_THRESHOLDS,
+            "model": model_id,
+            "revision": model_revision,
+            "returned_entities": logged_predictions,
+            "rejected_low_confidence": rejected_low_confidence,
+        })
     rule_detections: list[dict[str, Any]] = []
     for code, pattern in PATTERNS:
         for match in pattern.finditer(text):

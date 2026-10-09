@@ -3,16 +3,31 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
 
 from common.pipeline_log import event
 
+# "Qwen/Qwen3-4B-Instruct-2507": "cdbee75f17c01a7cc42f958dc650907174af0554",
+# MODEL_ID = "Qwen/Qwen3-1.7B"
+# MODEL_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
 
 MODEL_ID = "Qwen/Qwen3-1.7B"
 MODEL_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
 DEFAULT_CONTEXT_WINDOW = 40960
+MODEL_REGISTRY = {
+    "Qwen/Qwen3-1.7B": {
+        "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+        "context_window": 40960,
+    },
+    "Qwen/Qwen3-4B-Instruct-2507": {
+        "revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+        "context_window": 262144,
+    },
+}
+MODEL_IDS = tuple(MODEL_REGISTRY)
 MAX_NEW_TOKENS = 256
 
 # Generation is serialized because one model instance is shared by the API's
@@ -103,9 +118,15 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 class QwenGenerator:
     """Generate one strict JSON object with a pinned local Qwen model."""
 
-    def __init__(self, device: str, cache_dir: str | Path):
+    def __init__(self, device: str, cache_dir: str | Path, model_id: str | None = None):
         if device not in {"cpu", "cuda"}:
             raise ValueError("device must be 'cpu' or 'cuda'")
+
+        selected_model = model_id if model_id is not None else os.getenv("LOCAL_LLM_MODEL", MODEL_ID)
+        if selected_model not in MODEL_REGISTRY:
+            raise ValueError(f"Unsupported LOCAL_LLM_MODEL: {selected_model}")
+        self.model_id = selected_model
+        self.model_revision = MODEL_REGISTRY[selected_model]["revision"]
 
         # Keep heavy imports inside initialization so importing the service
         # module does not load PyTorch or Transformers eagerly.
@@ -114,14 +135,14 @@ class QwenGenerator:
 
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_ID,
-            revision=MODEL_REVISION,
+            self.model_id,
+            revision=self.model_revision,
             cache_dir=str(cache_dir),
         )
         dtype = torch.float16 if device == "cuda" else torch.float32
         self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            revision=MODEL_REVISION,
+            self.model_id,
+            revision=self.model_revision,
             cache_dir=str(cache_dir),
             torch_dtype=dtype,
         )
@@ -130,7 +151,7 @@ class QwenGenerator:
         context_window = getattr(
             getattr(self.model, "config", None),
             "max_position_embeddings",
-            DEFAULT_CONTEXT_WINDOW,
+            MODEL_REGISTRY[self.model_id]["context_window"],
         )
         if (not isinstance(context_window, int) or isinstance(context_window, bool)
                 or context_window <= MAX_NEW_TOKENS):
@@ -141,11 +162,12 @@ class QwenGenerator:
         self.input_budget = self.context_window - MAX_NEW_TOKENS
         self._torch = torch
 
+    def _event(self, stage: str, data: dict[str, Any]) -> None:
+        event(stage, {"model": self.model_id, "revision": self.model_revision, **data})
+
     def choose(self, system: str, payload: Any) -> dict[str, Any]:
         """Return a parsed JSON object; never accept prose or invented names."""
-        event("llm.input", {
-            "model": MODEL_ID,
-            "revision": MODEL_REVISION,
+        self._event("llm.input", {
             "system": system,
             "payload": payload,
             "context_window": self.context_window,
@@ -156,7 +178,7 @@ class QwenGenerator:
         try:
             payload_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError) as exc:
-            event("llm.error", {"type": type(exc).__name__, "phase": "serialize_payload",
+            self._event("llm.error", {"type": type(exc).__name__, "phase": "serialize_payload",
                                  "context_window": self.context_window,
                                  "input_budget": self.input_budget})
             raise GenerationError("Model input must be JSON-serializable") from exc
@@ -181,14 +203,12 @@ class QwenGenerator:
                 enable_thinking=False,
             )
         except Exception as exc:
-            event("llm.error", {"type": type(exc).__name__, "phase": "render_prompt",
+            self._event("llm.error", {"type": type(exc).__name__, "phase": "render_prompt",
                                  "system": system, "payload": payload,
                                  "context_window": self.context_window,
                                  "input_budget": self.input_budget})
             raise GenerationError("Could not render model input") from exc
-        event("llm.input", {
-            "model": MODEL_ID,
-            "revision": MODEL_REVISION,
+        self._event("llm.input", {
             "rendered_prompt": rendered,
             "context_window": self.context_window,
             "input_budget": self.input_budget,
@@ -197,23 +217,21 @@ class QwenGenerator:
             encoded = self.tokenizer(rendered, return_tensors="pt", add_special_tokens=False)
             input_ids = encoded["input_ids"]
         except Exception as exc:
-            event("llm.error", {"type": type(exc).__name__, "phase": "encode_input",
+            self._event("llm.error", {"type": type(exc).__name__, "phase": "encode_input",
                                  "rendered_prompt": rendered,
                                  "context_window": self.context_window,
                                  "input_budget": self.input_budget})
             raise GenerationError("Could not encode model input") from exc
 
         input_tokens = int(input_ids.shape[-1])
-        event("llm.input", {
-            "model": MODEL_ID,
-            "revision": MODEL_REVISION,
+        self._event("llm.input", {
             "rendered_prompt": rendered,
             "input_tokens": input_tokens,
             "context_window": self.context_window,
             "input_budget": self.input_budget,
         })
         if input_tokens > self.input_budget:
-            event("llm.error", {
+            self._event("llm.error", {
                 "type": "ContextLimitError",
                 "phase": "input_limit",
                 "input_tokens": input_tokens,
@@ -247,32 +265,31 @@ class QwenGenerator:
             completion_ids = output[0, input_ids.shape[-1] :]
             completion = self.tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         except Exception as exc:
-            event("llm.error", {"type": type(exc).__name__, "phase": "generation",
+            self._event("llm.error", {"type": type(exc).__name__, "phase": "generation",
                                  "rendered_prompt": rendered,
                                  "context_window": self.context_window,
                                  "input_budget": self.input_budget})
             raise GenerationError("Local model generation failed") from exc
 
-        event("llm.output", {
-            "model": MODEL_ID,
-            "revision": MODEL_REVISION,
+        self._event("llm.output", {
             "raw_completion": completion,
         })
 
         try:
             result = json.loads(completion, object_pairs_hook=_unique_object)
         except (json.JSONDecodeError, ValueError) as exc:
-            event("llm.error", {"type": type(exc).__name__, "phase": "parse_json",
+            self._event("llm.error", {"type": type(exc).__name__, "phase": "parse_json",
                                  "raw_completion": completion,
                                  "rendered_prompt": rendered,
                                  "context_window": self.context_window,
                                  "input_budget": self.input_budget})
             raise GenerationError("Local model did not return a strict JSON object") from exc
         if not isinstance(result, dict):
-            event("llm.error", {"type": "GenerationError", "phase": "validate_json",
+            self._event("llm.error", {"type": "GenerationError", "phase": "validate_json",
                                  "parsed": result, "rendered_prompt": rendered,
                                  "context_window": self.context_window,
                                  "input_budget": self.input_budget})
             raise GenerationError("Local model response must be a JSON object")
-        event("llm.output", {"parsed": result})
+        self._event("llm.output", {"parsed": result})
         return result
+

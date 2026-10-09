@@ -112,6 +112,6 @@ document.querySelectorAll("[data-copy]").forEach((button) => button.addEventList
     : button.dataset.copy === "received" ? receivedText : restoredText;
   if (text) {
     try { await navigator.clipboard.writeText(text); const old = button.textContent; button.textContent = "Скопировано"; setTimeout(() => button.textContent = old, 1200); }
-    catch (_) { $("status").className = "error"; $("status").textContent = "Не удалось скопировать: браузер запретил доступ к буферу обмена."; }
+    catch (_) { $("status").className = "error"; $("status").textContent = `Не удалось скопировать: браузер запретил доступ к буферу обмена.${pipelineId ? ` · GUID: ${pipelineId}` : ""}`; }
   }
 }));

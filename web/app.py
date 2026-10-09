@@ -17,7 +17,7 @@ from openai import (
     RateLimitError,
 )
 from pydantic import BaseModel, Field
-from common.pipeline_log import current_id, event, install_pipeline_logging
+from common.pipeline_log import PipelineLogError, current_id, event, install_pipeline_logging
 
 MAX_INPUT_CHARS = 50_000
 TIMEOUT_SECONDS = 120.0
@@ -135,6 +135,8 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
             request.state.processing_steps.update(anonymized.get("steps", {}))
             request.state.processing_steps["anonymized_text"] = prepared
             request.state.processing_warnings = anonymized.get("warnings", [])
+        except PipelineLogError:
+            raise
         except Exception:
             raise ApiError("anonymize", "pseudonymizer_unavailable",
                            "Не удалось псевдонимизировать текст. Запрос в OpenAI не отправлен.") from None
@@ -149,6 +151,8 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
             received = result.output_text
             dump = getattr(result, "model_dump", None)
             event("openai.response", dump(mode="json") if callable(dump) else {"output_text": received})
+        except PipelineLogError:
+            raise
         except AuthenticationError:
             raise ApiError("openai", "openai_authentication_failed",
                            "OpenAI отклонил ключ API. Проверьте OPENAI_API_KEY.",
@@ -177,6 +181,8 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
             restored_text = restored["text"]
             request.state.processing_steps.update(restored.get("steps", {}))
             warnings = list(dict.fromkeys(anonymized.get("warnings", []) + restored.get("warnings", [])))
+        except PipelineLogError:
+            raise
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 raise ApiError("deanonymize", "mapping_not_found",

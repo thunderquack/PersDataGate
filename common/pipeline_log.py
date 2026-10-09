@@ -7,11 +7,12 @@ import logging
 import os
 from pathlib import Path
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+if TYPE_CHECKING:
+    from fastapi import FastAPI, Request
+    from fastapi.responses import Response
 
 _pipeline_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("pipeline_id", default=None)
 _service: contextvars.ContextVar[str | None] = contextvars.ContextVar("pipeline_service", default=None)
@@ -22,6 +23,10 @@ _PIPELINE_ROUTES = {
     "pseudonymizer": {"/anonymize", "/deanonymize"},
 }
 logger = logging.getLogger("uvicorn.error")
+
+
+class PipelineLogError(RuntimeError):
+    """The pipeline event could not be serialized or persisted."""
 
 
 def parse_pipeline_id(value: str | None) -> str | None:
@@ -88,42 +93,47 @@ def event(stage: str, data: Any) -> None:
     pipeline_id = current_id()
     if pipeline_id is None:
         return
-    service = _service.get() or os.getenv("PIPELINE_SERVICE", "web")
-    if service not in _SERVICES:
-        raise ValueError("PIPELINE_SERVICE must be web or pseudonymizer")
-    record = {
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
-        "pipeline_id": pipeline_id,
-        "service": service,
-        "stage": str(stage),
-        "data": data,
-    }
-    line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-    root = _log_dir()
-    directory = root / pipeline_id
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        directory.chmod(0o700)
-    except OSError:
-        # Keep the log usable on filesystems that do not implement POSIX modes.
-        pass
-    target = directory / f"{service}.jsonl"
-    # Keep both process-local threads and multiple ASGI workers from interleaving records.
-    with _write_lock:
-        descriptor = os.open(target, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-        locked = False
+        service = _service.get() or os.getenv("PIPELINE_SERVICE", "web")
+        if service not in _SERVICES:
+            raise ValueError("PIPELINE_SERVICE must be web or pseudonymizer")
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            "pipeline_id": pipeline_id,
+            "service": service,
+            "stage": str(stage),
+            "data": data,
+        }
+        line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        root = _log_dir()
+        directory = root / pipeline_id
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            _lock_file(descriptor)
-            locked = True
-            written = os.write(descriptor, line)
-            if written != len(line):
-                raise OSError("incomplete pipeline log append")
-            os.fsync(descriptor)
-        finally:
-            if locked:
-                _unlock_file(descriptor)
-            os.close(descriptor)
-    logger.info("pipeline_id=%s stage=%s", pipeline_id, stage)
+            directory.chmod(0o700)
+        except OSError:
+            # Keep the log usable on filesystems that do not implement POSIX modes.
+            pass
+        target = directory / f"{service}.jsonl"
+        # Keep both process-local threads and multiple ASGI workers from interleaving records.
+        with _write_lock:
+            descriptor = os.open(target, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+            locked = False
+            try:
+                _lock_file(descriptor)
+                locked = True
+                written = os.write(descriptor, line)
+                if written != len(line):
+                    raise OSError("incomplete pipeline log append")
+                os.fsync(descriptor)
+            finally:
+                if locked:
+                    _unlock_file(descriptor)
+                os.close(descriptor)
+        logger.info("pipeline_id=%s stage=%s", pipeline_id, stage)
+    except PipelineLogError:
+        raise
+    except Exception as exc:
+        raise PipelineLogError("Could not persist pipeline event") from exc
 
 
 async def _body_json(request: Request) -> Any:
@@ -149,6 +159,7 @@ async def _response_json(response: Response) -> tuple[bytes, Any]:
 
 
 def _pipeline_error(pipeline_id: str, *, status_code: int, code: str) -> JSONResponse:
+    from fastapi.responses import JSONResponse
     messages = {
         "pipeline_log_failed": "Не удалось записать этапы обработки в журнал.",
         "pipeline_failed": "Внутренняя ошибка обработки запроса.",
@@ -163,7 +174,9 @@ def _pipeline_error(pipeline_id: str, *, status_code: int, code: str) -> JSONRes
 
 
 def _reserve_pipeline_dir(pipeline_id: str) -> bool:
-    directory = _log_dir() / pipeline_id
+    root = _log_dir()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory = root / pipeline_id
     try:
         directory.mkdir(parents=True, exist_ok=False, mode=0o700)
         try:
@@ -177,6 +190,7 @@ def _reserve_pipeline_dir(pipeline_id: str) -> bool:
 
 def install_pipeline_logging(app: FastAPI, service: str) -> None:
     """Attach correlation IDs and full JSON request/response logging to pipeline routes."""
+    from fastapi.responses import JSONResponse, Response
     if service not in _SERVICES:
         raise ValueError("service must be web or pseudonymizer")
     routes = _PIPELINE_ROUTES[service]

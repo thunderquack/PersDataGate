@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from common.pipeline_log import event, install_pipeline_logging
+from common.pipeline_log import PipelineLogError, event, install_pipeline_logging
 from .config import get_device
 from .service import MAX_TEXT_LENGTH, MappingStore, anonymize_text, expires_iso, restore_text
 
@@ -121,6 +121,8 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
                     request.text, app.state.detector, getattr(app.state, "pipeline", None),
                     steps=steps,
                 )
+        except PipelineLogError:
+            raise
         except Exception as exc:
             event("anonymization.error", {"type": type(exc).__name__})
             logger.error("Anonymization failed (%s)", type(exc).__name__)
@@ -148,6 +150,8 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
                     request.text, mapping, getattr(app.state, "pipeline", None),
                     steps=steps,
                 )
+        except PipelineLogError:
+            raise
         except Exception as exc:
             event("deanonymization.error", {"type": type(exc).__name__})
             logger.error("De-anonymization failed (%s)", type(exc).__name__)

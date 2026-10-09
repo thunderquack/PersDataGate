@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from common.pipeline_log import event
+from common.pipeline_log import PipelineLogError, event
 
 CHUNK_SIZE = 700
 CHUNK_OVERLAP = 120
@@ -209,7 +209,15 @@ def find_spans(text: str, model: Any) -> list[Span]:
     model_id = getattr(model, "model_id", None)
     model_revision = getattr(model, "model_revision", None)
     for chunk_index, (start, chunk) in enumerate(_chunks(text, getattr(model, "tokenizer", None))):
-        predictions = model.predict_entities(chunk, LABELS, threshold=0.45)
+        try:
+            predictions = model.predict_entities(chunk, LABELS, threshold=0.45)
+        except Exception as exc:
+            event("ner.error", {
+                "chunk_index": chunk_index, "chunk_offset": start,
+                "chunk_text": chunk, "model": model_id,
+                "revision": model_revision, "error_type": type(exc).__name__,
+            })
+            raise
         event("ner.chunk", {
             "chunk_index": chunk_index,
             "chunk_offset": start,
@@ -240,6 +248,9 @@ def find_spans(text: str, model: Any) -> list[Span]:
             if code == "IBAN":
                 iban = _iban_span(match)
                 if iban is None:
+                    rule_detections.append({"code": code, "start": match.start(),
+                                            "end": match.end(), "value": match.group(),
+                                            "accepted": False, "reason": "invalid_iban"})
                     continue
                 value, start, end = iban
                 spans.append(Span(start, end, value, code, 1.0, True))
@@ -428,6 +439,8 @@ def restore_text(text: str, mapping: dict[str, str], pipeline: Any | None = None
                 value = pipeline.restore(text, marker, record, match.start(), match.end())
                 if value is None:
                     reason = "model_uncertain"
+        except PipelineLogError:
+            raise
         except Exception:
             value = None
             reason = "local_model_error"

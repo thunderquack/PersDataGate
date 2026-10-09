@@ -8,7 +8,15 @@ from uuid import uuid4
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from common.pipeline_log import bind, current_id, event, install_pipeline_logging, parse_pipeline_id, reset
+from common.pipeline_log import (
+    PipelineLogError,
+    bind,
+    current_id,
+    event,
+    install_pipeline_logging,
+    parse_pipeline_id,
+    reset,
+)
 
 
 def _records(directory, pipeline_id, service):
@@ -34,6 +42,20 @@ def test_event_without_bound_context_is_noop(tmp_path, monkeypatch):
     monkeypatch.setenv("PIPELINE_LOG_DIR", str(tmp_path))
     event("startup", {"status": "ready"})
     assert list(tmp_path.iterdir()) == []
+
+
+def test_event_serialization_failure_has_distinct_exception(tmp_path, monkeypatch):
+    monkeypatch.setenv("PIPELINE_LOG_DIR", str(tmp_path))
+    tokens = bind(str(uuid4()), "pseudonymizer")
+    try:
+        try:
+            event("model.result", {"not_json": object()})
+        except PipelineLogError as exc:
+            assert isinstance(exc.__cause__, TypeError)
+        else:
+            raise AssertionError("event should report serialization failure")
+    finally:
+        reset(tokens)
 
 
 def test_concurrent_events_are_complete_jsonl_records(tmp_path, monkeypatch):

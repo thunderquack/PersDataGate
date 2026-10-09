@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from common.pipeline_log import event
+from common.pipeline_log import PipelineLogError, event
 
 
 class LocalGenerator(Protocol):
@@ -379,6 +379,8 @@ class PersonPipeline:
             # the caller to proceed to OpenAI with unresolved identities.
             try:
                 result = self.generator.choose(_SYSTEM_LINK, payload)
+            except PipelineLogError:
+                raise
             except Exception as exc:
                 event("person.link_decision", {
                     "left": payload["left"], "right": payload["right"],
@@ -437,6 +439,12 @@ class PersonPipeline:
         for i, j in ordered_pairs:
             if full_name(i) and full_name(j) and i not in overflow and j not in overflow:
                 store_decision(i, j, decide(i, j), full_same)
+            elif full_name(i) and full_name(j):
+                event("person.link_decision", {
+                    "left": {"mention": mentions[i].value, "start": mentions[i].start},
+                    "right": {"mention": mentions[j].value, "start": mentions[j].start},
+                    "decision": "kept_separate", "reason": "candidate_overflow",
+                })
         merge_same_pairs(full_same)
 
         anchored_roots: dict[int, set[int]] = {}
@@ -469,15 +477,35 @@ class PersonPipeline:
             if full_name(i) and full_name(j):
                 continue
             if i in quarantined or j in quarantined:
+                event("person.link_decision", {
+                    "left": {"mention": mentions[i].value, "start": mentions[i].start},
+                    "right": {"mention": mentions[j].value, "start": mentions[j].start},
+                    "decision": "kept_separate", "reason": "ambiguous_abbreviation",
+                })
                 continue
             roots_i, roots_j = anchored_roots.get(i, set()), anchored_roots.get(j, set())
             if full_name(i) and roots_j and root(i) not in roots_j:
+                event("person.link_decision", {
+                    "left": {"mention": mentions[i].value, "start": mentions[i].start},
+                    "right": {"mention": mentions[j].value, "start": mentions[j].start},
+                    "decision": "kept_separate", "reason": "not_linked_to_candidate_anchor",
+                })
                 continue
             if full_name(j) and roots_i and root(j) not in roots_i:
+                event("person.link_decision", {
+                    "left": {"mention": mentions[i].value, "start": mentions[i].start},
+                    "right": {"mention": mentions[j].value, "start": mentions[j].start},
+                    "decision": "kept_separate", "reason": "not_linked_to_candidate_anchor",
+                })
                 continue
             # Two abbreviated mentions tied to different complete identities
             # cannot act as a bridge between those identities.
             if roots_i and roots_j and roots_i.isdisjoint(roots_j):
+                event("person.link_decision", {
+                    "left": {"mention": mentions[i].value, "start": mentions[i].start},
+                    "right": {"mention": mentions[j].value, "start": mentions[j].start},
+                    "decision": "kept_separate", "reason": "different_candidate_anchors",
+                })
                 continue
             store_decision(i, j, decide(i, j), short_same)
         merge_same_pairs(short_same)
@@ -625,6 +653,8 @@ class PersonPipeline:
                                    "options": options, "payload": payload})
         try:
             result = self.generator.choose(_SYSTEM_FORM, payload)
+        except PipelineLogError:
+            raise
         except Exception as exc:
             event("restore.choice", {
                 "marker": marker, "canonical": canonical, "options": options,

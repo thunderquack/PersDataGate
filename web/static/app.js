@@ -1,5 +1,6 @@
 const $ = (id) => document.getElementById(id);
 let receivedText = "", restoredText = "", sentRequest = null;
+let pipelineId = "";
 
 function setText(id, text, empty = false) {
   const node = $(id);
@@ -79,12 +80,14 @@ function clearSteps() {
 
 $("process").addEventListener("click", async () => {
   const button = $("process"); button.disabled = true; receivedText = ""; restoredText = ""; sentRequest = null;
-  $("status").className = ""; $("status").textContent = "Обработка…"; $("warnings").textContent = "";
+  pipelineId = crypto.randomUUID();
+  $("status").className = ""; $("status").textContent = `Обработка… · GUID: ${pipelineId}`; $("warnings").textContent = "";
   clearSteps();
   setText("request", "Ожидание результата…", true); setText("received", "Ожидание ответа…", true); setText("restored", "Ожидание восстановления…", true);
   try {
-    const response = await fetch("/api/process", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({document:$("document").value,prompt:$("prompt").value})});
+    const response = await fetch("/api/process", {method:"POST", headers:{"Content-Type":"application/json", "X-Pipeline-ID":pipelineId}, body:JSON.stringify({document:$("document").value,prompt:$("prompt").value})});
     const result = await response.json();
+    pipelineId = result.pipeline_id || response.headers.get("X-Pipeline-ID") || pipelineId;
     showSteps(result);
     if (result.sent_request) showRequest(result.sent_request);
     else if (result.prepared_text) setText("request", `Подготовленный псевдонимизированный текст:\n${result.prepared_text}`);
@@ -93,9 +96,9 @@ $("process").addEventListener("click", async () => {
     if (typeof result.restored_text === "string") { restoredText = result.restored_text; setText("restored", restoredText, !restoredText); }
     $("warnings").textContent = (result.warnings || []).join(" ");
     if (!response.ok) throw new Error(result.error?.message || "Не удалось обработать текст.");
-    $("status").textContent = "Готово";
+    $("status").textContent = `Готово · GUID: ${pipelineId}`;
   } catch (error) {
-    $("status").className = "error"; $("status").textContent = error.message || "Ошибка обработки.";
+    $("status").className = "error"; $("status").textContent = `${error.message || "Ошибка обработки."} · GUID: ${pipelineId}`;
     if (!sentRequest && !$("request").textContent.includes("Подготовленный")) setText("request", "Запрос в OpenAI не сформирован.", true);
     if (!receivedText) setText("received", "Ответ пока не получен.", true);
     if (!restoredText) setText("restored", "Ответ пока не восстановлен.", true);

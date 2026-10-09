@@ -17,6 +17,7 @@ from openai import (
     RateLimitError,
 )
 from pydantic import BaseModel, Field
+from common.pipeline_log import current_id, event, install_pipeline_logging
 
 MAX_INPUT_CHARS = 50_000
 TIMEOUT_SECONDS = 120.0
@@ -50,7 +51,8 @@ class PseudonymizerClient:
 
     async def anonymize(self, text: str) -> dict[str, Any]:
         response = await self.client.post(
-            f"{self.base_url}/anonymize", json={"text": text, "include_steps": True}
+            f"{self.base_url}/anonymize", json={"text": text, "include_steps": True},
+            headers={"X-Pipeline-ID": current_id()} if current_id() else {},
         )
         response.raise_for_status()
         return response.json()
@@ -58,7 +60,8 @@ class PseudonymizerClient:
     async def deanonymize(self, mapping_id: str, text: str) -> dict[str, Any]:
         response = await self.client.post(
             f"{self.base_url}/deanonymize",
-            json={"mapping_id": mapping_id, "text": text, "include_steps": True}
+            json={"mapping_id": mapping_id, "text": text, "include_steps": True},
+            headers={"X-Pipeline-ID": current_id()} if current_id() else {},
         )
         response.raise_for_status()
         return response.json()
@@ -86,6 +89,7 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
             await app.state.openai_client.close()
 
     app = FastAPI(title="PersDataGate Web", lifespan=lifespan)
+    install_pipeline_logging(app, service="web")
     app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 
     @app.exception_handler(ApiError)
@@ -114,6 +118,7 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
         request.state.processing_steps = {}
         request.state.processing_warnings = []
         combined = f"[ПРОМПТ]\n{body.prompt}\n\n[ДОКУМЕНТ]\n{body.document}"
+        event("web.input", {"document": body.document, "prompt": body.prompt, "combined": combined})
         if len(body.prompt) + len(body.document) > MAX_INPUT_CHARS or len(combined) > MAX_INPUT_CHARS:
             return JSONResponse(status_code=413, content={"error": {
                 "stage": "validation", "code": "input_too_large",
@@ -125,6 +130,7 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
         prepared = ""
         try:
             anonymized = await request.app.state.pseudonymizer.anonymize(combined)
+            event("web.anonymized", anonymized)
             mapping_id, prepared = anonymized["mapping_id"], anonymized["text"]
             request.state.processing_steps.update(anonymized.get("steps", {}))
             request.state.processing_steps["anonymized_text"] = prepared
@@ -134,12 +140,15 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
                            "Не удалось псевдонимизировать текст. Запрос в OpenAI не отправлен.") from None
         sent_request = {"model": model, "instructions": OPENAI_INSTRUCTIONS,
                         "input": prepared, "store": False}
+        event("openai.request", {**sent_request, "timeout": TIMEOUT_SECONDS})
         try:
             result = await request.app.state.openai_client.responses.create(
                 model=model, instructions=OPENAI_INSTRUCTIONS, input=prepared, store=False,
                 timeout=TIMEOUT_SECONDS,
             )
             received = result.output_text
+            dump = getattr(result, "model_dump", None)
+            event("openai.response", dump(mode="json") if callable(dump) else {"output_text": received})
         except AuthenticationError:
             raise ApiError("openai", "openai_authentication_failed",
                            "OpenAI отклонил ключ API. Проверьте OPENAI_API_KEY.",
@@ -164,6 +173,7 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
                            prepared=prepared, sent_request=sent_request) from None
         try:
             restored = await request.app.state.pseudonymizer.deanonymize(mapping_id, received)
+            event("web.restored", restored)
             restored_text = restored["text"]
             request.state.processing_steps.update(restored.get("steps", {}))
             warnings = list(dict.fromkeys(anonymized.get("warnings", []) + restored.get("warnings", [])))

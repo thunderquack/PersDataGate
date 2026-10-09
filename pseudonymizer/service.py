@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from common.pipeline_log import event
+
 CHUNK_SIZE = 700
 CHUNK_OVERLAP = 120
 MAX_TEXT_LENGTH = 50_000
@@ -204,8 +206,21 @@ def find_spans(text: str, model: Any) -> list[Span]:
     spans: list[Span] = []
     # Include only high-risk entities; do not ask GLiNER to extract generic dates,
     # organizations, or geographic names.
-    for start, chunk in _chunks(text, getattr(model, "tokenizer", None)):
-        for item in model.predict_entities(chunk, LABELS, threshold=0.45):
+    model_id = getattr(model, "model_id", None)
+    model_revision = getattr(model, "model_revision", None)
+    for chunk_index, (start, chunk) in enumerate(_chunks(text, getattr(model, "tokenizer", None))):
+        predictions = model.predict_entities(chunk, LABELS, threshold=0.45)
+        event("ner.chunk", {
+            "chunk_index": chunk_index,
+            "chunk_offset": start,
+            "chunk_text": chunk,
+            "labels": LABELS,
+            "threshold": 0.45,
+            "model": model_id,
+            "revision": model_revision,
+            "returned_entities": predictions,
+        })
+        for item in predictions:
             value = item.get("text", "")
             local_start = item.get("start")
             local_end = item.get("end")
@@ -219,6 +234,7 @@ def find_spans(text: str, model: Any) -> list[Span]:
                     continue
                 span = Span(entity_start, entity_end, entity_text, code, float(item.get("score", 0)))
                 spans.append(_expand_contextual_address(text, span))
+    rule_detections: list[dict[str, Any]] = []
     for code, pattern in PATTERNS:
         for match in pattern.finditer(text):
             if code == "IBAN":
@@ -227,6 +243,8 @@ def find_spans(text: str, model: Any) -> list[Span]:
                     continue
                 value, start, end = iban
                 spans.append(Span(start, end, value, code, 1.0, True))
+                rule_detections.append({"code": code, "start": start, "end": end,
+                                        "value": value, "accepted": True})
                 continue
             group = next((name for name, value in match.groupdict().items() if value is not None), None)
             value = match.group(group) if group else match.group()
@@ -240,8 +258,14 @@ def find_spans(text: str, model: Any) -> list[Span]:
                     end = start + len(value)
                 digits = sum(char.isdigit() for char in value)
                 if digits > 15 or digits < 7:
+                    rule_detections.append({"code": code, "start": start, "end": end,
+                                            "value": value, "accepted": False,
+                                            "reason": "invalid_digit_count"})
                     continue
             spans.append(Span(start, end, value, code, 1.0, True))
+            rule_detections.append({"code": code, "start": start, "end": end,
+                                    "value": value, "accepted": True})
+    event("ner.rules", {"detections": rule_detections})
 
     # Deduplicate overlapping-window matches, then resolve overlap by rule,
     # longer span, and confidence in that order.
@@ -251,11 +275,30 @@ def find_spans(text: str, model: Any) -> list[Span]:
         if key not in unique or span.confidence > unique[key].confidence:
             unique[key] = span
     candidates = list(unique.values())
-    candidates.sort(key=lambda s: (not s.rule, -(s.end - s.start), -s.confidence, s.start))
     selected: list[Span] = []
+    rejected: list[dict[str, Any]] = []
+    candidates.sort(key=lambda s: (not s.rule, -(s.end - s.start), -s.confidence, s.start))
     for candidate in candidates:
-        if not any(candidate.start < other.end and other.start < candidate.end for other in selected):
+        overlaps = [other for other in selected
+                    if candidate.start < other.end and other.start < candidate.end]
+        if not overlaps:
             selected.append(candidate)
+        else:
+            rejected.append({"start": candidate.start, "end": candidate.end,
+                             "value": candidate.value, "code": candidate.code,
+                             "source": "rule" if candidate.rule else "gliner",
+                             "overlaps": [{"start": other.start, "end": other.end,
+                                           "value": other.value, "code": other.code}
+                                          for other in overlaps]})
+    event("ner.selected", {
+        "candidates": [{"start": span.start, "end": span.end, "value": span.value,
+                        "code": span.code, "confidence": span.confidence,
+                        "source": "rule" if span.rule else "gliner"} for span in candidates],
+        "selected": [{"start": span.start, "end": span.end, "value": span.value,
+                      "code": span.code, "confidence": span.confidence,
+                      "source": "rule" if span.rule else "gliner"} for span in selected],
+        "rejected_overlaps": rejected,
+    })
     return sorted(selected, key=lambda s: s.start)
 
 
@@ -311,6 +354,16 @@ def anonymize_text(text: str, model: Any, pipeline: Any | None = None, *,
         cursor = span.end
     pieces.append(text[cursor:])
     anonymized_text = "".join(pieces)
+    event("anonymization.result", {
+        "anonymized_text": anonymized_text,
+        "mapping": dict(mapping),
+        "persons": [
+            {"marker": marker, "canonical": record.canonical,
+             "aliases": list(record.aliases)}
+            for marker, record in mapping.persons.items()
+        ],
+        "warnings": list(mapping.warnings),
+    })
     if steps is not None:
         mentions_by_marker: dict[str, list[dict[str, Any]]] = {}
         for span in spans:
@@ -392,6 +445,12 @@ def restore_text(text: str, mapping: dict[str, str], pipeline: Any | None = None
         return value
 
     restored = _MARKER.sub(replace, text)
+    event("restore.result", {
+        "input_text": text,
+        "restored_text": restored,
+        "occurrences": sorted(occurrences, key=lambda item: item["start"]),
+        "warnings": warnings,
+    })
     if steps is not None:
         # Each invocation produces a fresh trace. Caller mappings and stored
         # restoration state remain untouched.

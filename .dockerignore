@@ -8,4 +8,5 @@ __pycache__
 .pytest_cache
 test-results
 artifacts
+logs
 tests

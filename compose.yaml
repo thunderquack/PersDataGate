@@ -8,6 +8,8 @@ services:
     gpus: all
     environment:
       DEVICE: cuda
+      PIPELINE_LOG_DIR: /pipeline-logs
+      PIPELINE_SERVICE: pseudonymizer
       HF_HOME: /models/huggingface
       HF_HUB_DOWNLOAD_TIMEOUT: "120"
       HF_HUB_ETAG_TIMEOUT: "30"
@@ -15,6 +17,7 @@ services:
     volumes:
       - model-cache:/models
       - ./.deps/pip-cache:/pip-cache
+      - ./logs/pipelines:/pipeline-logs
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5)"]
       interval: 15s
@@ -31,9 +34,13 @@ services:
       - "127.0.0.1:${WEB_PORT:-8090}:8000"
     environment:
       PSEUDONYMIZER_URL: http://pseudonymizer:8000
+      PIPELINE_LOG_DIR: /pipeline-logs
+      PIPELINE_SERVICE: web
       PSEUDONYMIZER_TIMEOUT_SECONDS: ${PSEUDONYMIZER_TIMEOUT_SECONDS:-600}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
+    volumes:
+      - ./logs/pipelines:/pipeline-logs
     depends_on:
       pseudonymizer:
         condition: service_healthy

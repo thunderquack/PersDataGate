@@ -13,6 +13,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from common.pipeline_log import event
+
 
 class LocalGenerator(Protocol):
     def choose(self, system: str, payload: dict[str, Any]) -> dict[str, Any]: ...
@@ -332,6 +334,16 @@ class PersonPipeline:
 
         warnings: list[str] = []
         candidate_pairs, overflow = self._candidate_pairs(mentions)
+        event("person.candidates", {
+            "mentions": [{"value": mention.value, "start": mention.start,
+                          "end": mention.end} for mention in mentions],
+            "candidate_pairs": [
+                {"left": mentions[i].value, "left_start": mentions[i].start,
+                 "right": mentions[j].value, "right_start": mentions[j].start}
+                for i, j in sorted(candidate_pairs)
+            ],
+            "overflow_indices": sorted(overflow),
+        })
         if overflow:
             warnings.append("Some person mentions had too many candidates and were kept separate.")
         cannot_link: set[tuple[int, int]] = set()
@@ -365,9 +377,21 @@ class PersonPipeline:
             }
             # A local-model failure blocks pseudonymization and must not allow
             # the caller to proceed to OpenAI with unresolved identities.
-            result = self.generator.choose(_SYSTEM_LINK, payload)
+            try:
+                result = self.generator.choose(_SYSTEM_LINK, payload)
+            except Exception as exc:
+                event("person.link_decision", {
+                    "left": payload["left"], "right": payload["right"],
+                    "decision": "error", "error_type": type(exc).__name__,
+                })
+                raise
             relation = result.get("relation") if isinstance(result, dict) else None
-            return relation if relation in ("same", "different", "unknown") else "invalid"
+            decision = relation if relation in ("same", "different", "unknown") else "invalid"
+            event("person.link_decision", {
+                "left": payload["left"], "right": payload["right"],
+                "decision": decision, "model_result": result,
+            })
+            return decision
 
         def merge_same_pairs(same_pairs: list[tuple[int, int]]) -> None:
             for i, j in same_pairs:
@@ -378,8 +402,16 @@ class PersonPipeline:
                               for a in range(len(mentions)) if root(a) == left_root
                               for b in range(len(mentions)) if root(b) == right_root)
                 if blocked:
+                    event("person.link_conflict", {
+                        "left": mentions[i].value, "right": mentions[j].value,
+                        "reason": "contradicts_prior_different_or_unknown_decision",
+                    })
                     warnings.append("Conflicting person identities were kept separate.")
                 elif not union(i, j):
+                    event("person.link_conflict", {
+                        "left": mentions[i].value, "right": mentions[j].value,
+                        "reason": "incompatible_name_components",
+                    })
                     warnings.append("Conflicting person-name details were kept separate.")
 
         def store_decision(i: int, j: int, relation: str,
@@ -420,6 +452,16 @@ class PersonPipeline:
             anchored_roots[index] = anchors
             if len(anchors) > 1 or index in overflow:
                 quarantined.add(index)
+                event("person.link_decision", {
+                    "mention": mentions[index].value,
+                    "start": mentions[index].start,
+                    "decision": "kept_separate",
+                    "reason": "ambiguous_abbreviation" if len(anchors) > 1 else "candidate_overflow",
+                    "anchor_mentions": [
+                        {"value": mentions[other].value, "start": mentions[other].start}
+                        for other in range(len(mentions)) if root(other) in anchors
+                    ],
+                })
                 warnings.append("An ambiguous abbreviated person-name mention matched multiple people and was kept separate.")
 
         short_same: list[tuple[int, int]] = []
@@ -445,6 +487,7 @@ class PersonPipeline:
             groups.setdefault(root(index), []).append(index)
 
         records_by_start: dict[int, PersonRecord] = {}
+        logged_groups: list[dict[str, Any]] = []
         for members in groups.values():
             observed = [mentions[index].value for index in members]
             canonical = self._canonical(observed)
@@ -453,8 +496,17 @@ class PersonPipeline:
                 canonical=canonical,
                 aliases=tuple(dict.fromkeys(observed)),
             )
+            logged_groups.append({
+                "mention_values": observed,
+                "mention_offsets": [{"start": mentions[index].start,
+                                     "end": mentions[index].end} for index in members],
+                "canonical": record.canonical,
+                "aliases": list(record.aliases),
+                "identifier": record.identifier,
+            })
             for index in members:
                 records_by_start[mentions[index].start] = record
+        event("person.groups", {"groups": logged_groups})
         return records_by_start, list(dict.fromkeys(warnings))
 
     def _canonical(self, observed: list[str]) -> str:
@@ -543,10 +595,19 @@ class PersonPipeline:
         # block and a Latin canonical name.
         if (_LATIN.search(canonical) and not _CYRILLIC.search(canonical)
                 and self._is_german_recipient_address(text, marker, start, end)):
+            event("restore.choice", {
+                "marker": marker, "canonical": canonical, "options": [canonical],
+                "start": start, "end": end, "chosen": canonical,
+                "reason": "recipient_address",
+            })
             return canonical, "recipient_address"
 
         options = self._forms(record.canonical)
         if not options:
+            event("restore.choice", {
+                "marker": marker, "canonical": canonical, "options": [],
+                "start": start, "end": end, "chosen": None, "reason": "no_forms",
+            })
             return None, "no_forms"
         window_start = max(0, start - 180)
         window_end = min(len(text), end + 180)
@@ -560,17 +621,44 @@ class PersonPipeline:
             "context_start": window_start,
             "allowed_forms": options,
         }
+        event("restore.options", {"marker": marker, "canonical": canonical,
+                                   "options": options, "payload": payload})
         try:
             result = self.generator.choose(_SYSTEM_FORM, payload)
-        except Exception:
+        except Exception as exc:
+            event("restore.choice", {
+                "marker": marker, "canonical": canonical, "options": options,
+                "start": start, "end": end, "chosen": None,
+                "reason": "local_model_error", "error_type": type(exc).__name__,
+            })
             return None, "local_model_error"
         if not isinstance(result, dict) or "form" not in result:
+            event("restore.choice", {
+                "marker": marker, "canonical": canonical, "options": options,
+                "start": start, "end": end, "model_result": result,
+                "chosen": None, "reason": "invalid_model_choice",
+            })
             return None, "invalid_model_choice"
         form = result["form"]
         if form is None:
+            event("restore.choice", {
+                "marker": marker, "canonical": canonical, "options": options,
+                "start": start, "end": end, "model_result": result,
+                "chosen": None, "reason": "model_uncertain",
+            })
             return None, "model_uncertain"
         if not isinstance(form, str) or form not in options:
+            event("restore.choice", {
+                "marker": marker, "canonical": canonical, "options": options,
+                "start": start, "end": end, "model_result": result,
+                "chosen": None, "reason": "invalid_model_choice",
+            })
             return None, "invalid_model_choice"
+        event("restore.choice", {
+            "marker": marker, "canonical": canonical, "options": options,
+            "start": start, "end": end, "model_result": result,
+            "chosen": form, "reason": "model_selected",
+        })
         return form, "model_selected"
 
     def _forms(self, canonical: str) -> list[str]:

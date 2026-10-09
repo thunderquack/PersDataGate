@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from common.pipeline_log import event, install_pipeline_logging
 from .config import get_device
 from .service import MAX_TEXT_LENGTH, MappingStore, anonymize_text, expires_iso, restore_text
 
@@ -31,11 +32,14 @@ class DeanonymizeRequest(BaseModel):
 
 
 class GLiNERDetector:
-    def __init__(self, model: Any, inference_mode: Any):
+    def __init__(self, model: Any, inference_mode: Any,
+                 model_id: str = GLINER_MODEL_ID, revision: str = GLINER_REVISION):
         self.model = model
         self.tokenizer = model.data_processor.transformer_tokenizer
         self.lock = threading.Lock()
         self.inference_mode = inference_mode
+        self.model_id = model_id
+        self.model_revision = revision
 
     def predict_entities(self, *args: Any, **kwargs: Any) -> Any:
         with self.lock, self.inference_mode():
@@ -73,7 +77,9 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
                 )
                 model.to(device)
                 model.eval()
-                app.state.detector = GLiNERDetector(model, torch.inference_mode)
+                app.state.detector = GLiNERDetector(
+                    model, torch.inference_mode, GLINER_MODEL_ID, GLINER_REVISION
+                )
                 if pipeline is None:
                     from .local_llm import QwenGenerator
                     from .persons import PersonPipeline
@@ -96,6 +102,7 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
             close()
 
     app = FastAPI(title="PersDataGate Pseudonymizer", lifespan=lifespan)
+    install_pipeline_logging(app, service="pseudonymizer")
 
     @app.get("/health/ready")
     async def readiness() -> dict[str, bool | str]:
@@ -115,6 +122,7 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
                     steps=steps,
                 )
         except Exception as exc:
+            event("anonymization.error", {"type": type(exc).__name__})
             logger.error("Anonymization failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail="anonymization_failed") from exc
         mapping_id, expiration = app.state.store.create(mapping)
@@ -141,6 +149,7 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
                     steps=steps,
                 )
         except Exception as exc:
+            event("deanonymization.error", {"type": type(exc).__name__})
             logger.error("De-anonymization failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail="deanonymization_failed") from exc
         response = {"text": text, "warnings": warnings}

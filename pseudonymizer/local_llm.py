@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from common.pipeline_log import event
+
 
 MODEL_ID = "Qwen/Qwen3-1.7B"
 MODEL_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
@@ -115,11 +117,18 @@ class QwenGenerator:
 
     def choose(self, system: str, payload: Any) -> dict[str, Any]:
         """Return a parsed JSON object; never accept prose or invented names."""
+        event("llm.input", {
+            "model": MODEL_ID,
+            "revision": MODEL_REVISION,
+            "system": system,
+            "payload": payload,
+        })
         if not isinstance(system, str):
             raise GenerationError("Model instructions must be text")
         try:
             payload_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError) as exc:
+            event("llm.error", {"type": type(exc).__name__, "phase": "serialize_payload"})
             raise GenerationError("Model input must be JSON-serializable") from exc
 
         messages = [
@@ -144,11 +153,24 @@ class QwenGenerator:
             encoded = self.tokenizer(rendered, return_tensors="pt", add_special_tokens=False)
             input_ids = encoded["input_ids"]
         except Exception as exc:
+            event("llm.error", {"type": type(exc).__name__, "phase": "encode_input"})
             raise GenerationError("Could not encode model input") from exc
 
         input_tokens = int(input_ids.shape[-1])
+        event("llm.input", {
+            "model": MODEL_ID,
+            "revision": MODEL_REVISION,
+            "rendered_prompt": rendered,
+            "input_tokens": input_tokens,
+        })
         input_budget = MAX_TOTAL_TOKENS - MAX_NEW_TOKENS
         if input_tokens > input_budget:
+            event("llm.error", {
+                "type": "GenerationError",
+                "phase": "input_limit",
+                "input_tokens": input_tokens,
+                "maximum_input_tokens": input_budget,
+            })
             raise GenerationError(
                 f"Model input is too large ({input_tokens} tokens); maximum is "
                 f"{input_budget} input tokens"
@@ -176,12 +198,24 @@ class QwenGenerator:
             completion_ids = output[0, input_ids.shape[-1] :]
             completion = self.tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         except Exception as exc:
+            event("llm.error", {"type": type(exc).__name__, "phase": "generation"})
             raise GenerationError("Local model generation failed") from exc
+
+        event("llm.output", {
+            "model": MODEL_ID,
+            "revision": MODEL_REVISION,
+            "raw_completion": completion,
+        })
 
         try:
             result = json.loads(completion, object_pairs_hook=_unique_object)
         except (json.JSONDecodeError, ValueError) as exc:
+            event("llm.error", {"type": type(exc).__name__, "phase": "parse_json",
+                                 "raw_completion": completion})
             raise GenerationError("Local model did not return a strict JSON object") from exc
         if not isinstance(result, dict):
+            event("llm.error", {"type": "GenerationError", "phase": "validate_json",
+                                 "parsed": result})
             raise GenerationError("Local model response must be a JSON object")
+        event("llm.output", {"parsed": result})
         return result

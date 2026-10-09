@@ -1,2 +1,2 @@
 # Optional lightweight dependencies installed at container startup.
-# Keep additions compatible with the image baseline in requirements.cpu.txt / requirements.cuda.txt.
+# Keep additions compatible with the pinned image baseline in pseudonymizer/Dockerfile.

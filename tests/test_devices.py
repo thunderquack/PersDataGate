@@ -202,12 +202,39 @@ def test_dependency_installer_rejects_invalid_device_before_pip(monkeypatch, tmp
     assert calls == []
 
 
-def test_cpu_requirements_do_not_request_cuda_or_nvidia_packages():
-    requirements = Path(__file__).parents[1] / "pseudonymizer/requirements.cpu.txt"
-    contents = requirements.read_text(encoding="utf-8").lower()
-    assert "torch==" in contents and "+cpu" in contents
-    assert "+cu" not in contents
-    assert "nvidia-" not in contents
+def test_pseudonymizer_dockerfile_pins_cpu_and_cuda_torch_builds():
+    dockerfile = Path(__file__).parents[1] / "pseudonymizer/Dockerfile"
+    contents = dockerfile.read_text(encoding="utf-8").lower()
+    assert '"torch==2.7.1+cpu"' in contents
+    assert '"torch==2.7.1+cu128"' in contents
+    assert "download.pytorch.org/whl/cpu" in contents
+    assert "download.pytorch.org/whl/cu128" in contents
+
+
+def test_pseudonymizer_dockerfile_installs_direct_dependencies_in_individual_layers():
+    dockerfile = Path(__file__).parents[1] / "pseudonymizer/Dockerfile"
+    lines = dockerfile.read_text(encoding="utf-8").lower().splitlines()
+    pip_run_lines = [line.strip() for line in lines if line.strip().startswith("run python -m pip install")]
+
+    assert len(pip_run_lines) >= 9
+    expected_packages = {
+        '"fastapi==0.115.12"',
+        '"uvicorn[standard]==0.34.2"',
+        '"pydantic==2.11.4"',
+        '"transformers==4.51.3"',
+        '"huggingface-hub==0.30.2"',
+        '"tokenizers==0.21.1"',
+        '"hf-xet==1.3.0"',
+        '"pymorphy3==2.0.3"',
+        '"peft==0.15.2"',
+        '"gliner2[local]==2.0.0"',
+    }
+    for package in expected_packages:
+        matching_lines = [line for line in pip_run_lines if package in line]
+        assert len(matching_lines) == 1, f"Expected one individual install layer for {package}"
+    assert not any(" -r " in line for line in lines if line.strip().startswith("run python -m pip install"))
+    assert "python -m pseudonymizer.dependencies" not in "\n".join(lines)
+    assert "base-requirements.txt" not in "\n".join(lines)
 
 
 def test_runtime_installer_uses_constraints_and_skips_empty_requirements(monkeypatch, tmp_path: Path):

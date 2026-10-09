@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
 import threading
-from contextlib import asynccontextmanager
+import tempfile
+from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -20,6 +23,64 @@ GLINER_MODEL_ID = "fastino/gliner2.5-multi-v1"
 GLINER_REVISION = "cf5593a5d45e3bbf204b9df621b13b1c0cf25ee3"
 
 logger = logging.getLogger("uvicorn.error")
+
+GLINER2_SNAPSHOT_FILES = (
+    "config.json",
+    "encoder_config/config.json",
+    "model.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
+
+
+def _normalize_gliner2_tokenizer_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Translate GLiNER2's Transformers 5 token list for Transformers 4.x."""
+    if not isinstance(config, dict):
+        raise ValueError("GLiNER2 tokenizer config must be a JSON object")
+    extra_tokens = config.get("extra_special_tokens", {})
+    if isinstance(extra_tokens, dict):
+        return config
+    if not isinstance(extra_tokens, list) or any(
+        not isinstance(token, str) or not token for token in extra_tokens
+    ):
+        raise ValueError("GLiNER2 extra_special_tokens must be a mapping or string list")
+
+    normalized = dict(config)
+    normalized.pop("extra_special_tokens", None)
+    additional_tokens = normalized.get("additional_special_tokens", [])
+    if not isinstance(additional_tokens, list) or any(
+        not isinstance(token, str) or not token for token in additional_tokens
+    ):
+        raise ValueError("GLiNER2 tokenizer additional_special_tokens must be a list")
+    normalized["additional_special_tokens"] = list(dict.fromkeys(additional_tokens + extra_tokens))
+    return normalized
+
+
+@contextmanager
+def _compatible_gliner2_snapshot(snapshot_path: str):
+    """Yield a Transformers 4-compatible view without editing the HF cache."""
+    source = Path(snapshot_path)
+    tokenizer_config_path = source / "tokenizer_config.json"
+    with tokenizer_config_path.open(encoding="utf-8") as file:
+        tokenizer_config = json.load(file)
+    normalized_config = _normalize_gliner2_tokenizer_config(tokenizer_config)
+    if normalized_config is tokenizer_config:
+        yield str(source)
+        return
+
+    with tempfile.TemporaryDirectory(prefix="persdatagate-gliner2-") as directory:
+        compatible_snapshot = Path(directory)
+        for relative_path in GLINER2_SNAPSHOT_FILES:
+            source_file = source / relative_path
+            target_file = compatible_snapshot / relative_path
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            if relative_path == "tokenizer_config.json":
+                target_file.write_text(
+                    json.dumps(normalized_config, ensure_ascii=False), encoding="utf-8"
+                )
+            else:
+                target_file.symlink_to(source_file.resolve())
+        yield str(compatible_snapshot)
 
 
 class AnonymizeRequest(BaseModel):
@@ -120,18 +181,13 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
                     repo_id=GLINER_MODEL_ID,
                     revision=GLINER_REVISION,
                     cache_dir=cache_dir,
-                    allow_patterns=[
-                        "config.json",
-                        "encoder_config/config.json",
-                        "model.safetensors",
-                        "tokenizer.json",
-                        "tokenizer_config.json",
-                    ],
+                    allow_patterns=list(GLINER2_SNAPSHOT_FILES),
                 )
-                model = AutoExtractor.from_pretrained(
-                    model_snapshot,
-                    map_location=device,
-                )
+                with _compatible_gliner2_snapshot(model_snapshot) as compatible_snapshot:
+                    model = AutoExtractor.from_pretrained(
+                        compatible_snapshot,
+                        map_location=device,
+                    )
                 model.eval()
                 app.state.detector = GLiNER2Detector(
                     model, torch.inference_mode, GLINER_MODEL_ID, GLINER_REVISION

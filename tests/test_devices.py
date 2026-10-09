@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 from pathlib import Path
+import shutil
 import sys
 import types
 
@@ -11,8 +13,26 @@ from pseudonymizer import bootstrap, dependencies
 from pseudonymizer.config import get_device
 
 
-def _fake_model(monkeypatch, *, cuda_available: bool):
+def _fake_model(monkeypatch, *, cuda_available: bool, snapshot_path: Path):
     calls = {"cuda_checks": 0, "to": [], "eval": 0, "loads": []}
+    snapshot_path.mkdir()
+    source_config = {
+        "tokenizer_class": "DebertaV2Tokenizer",
+        "additional_special_tokens": ["[BASE]"],
+        "extra_special_tokens": ["[SEP_STRUCT]", "[SEP_TEXT]"],
+    }
+    (snapshot_path / "tokenizer_config.json").write_text(json.dumps(source_config), encoding="utf-8")
+    (snapshot_path / "config.json").write_text("{}", encoding="utf-8")
+    (snapshot_path / "encoder_config").mkdir()
+    (snapshot_path / "encoder_config" / "config.json").write_text("{}", encoding="utf-8")
+    token_ids = [250102, 250103]
+    (snapshot_path / "tokenizer.json").write_text(json.dumps({
+        "added_tokens": [
+            {"id": token_id, "content": token}
+            for token_id, token in zip(token_ids, source_config["extra_special_tokens"])
+        ],
+    }), encoding="utf-8")
+    (snapshot_path / "model.safetensors").write_bytes(b"test fixture")
 
     class FakeModel:
         processor = types.SimpleNamespace(tokenizer=object())
@@ -44,13 +64,16 @@ def _fake_model(monkeypatch, *, cuda_available: bool):
     torch.inference_mode = InferenceMode
 
     def from_pretrained(*args, **kwargs):
-        calls["loads"].append((args, kwargs))
+        compatible_path = Path(args[0])
+        compatible_config = json.loads((compatible_path / "tokenizer_config.json").read_text(encoding="utf-8"))
+        compatible_tokenizer = json.loads((compatible_path / "tokenizer.json").read_text(encoding="utf-8"))
+        calls["loads"].append((args, kwargs, compatible_config, compatible_tokenizer))
         return model
 
     gliner2 = types.ModuleType("gliner2")
     gliner2.AutoExtractor = types.SimpleNamespace(from_pretrained=from_pretrained)
     hub = types.ModuleType("huggingface_hub")
-    hub.snapshot_download = lambda **kwargs: "/fake/model-snapshot"
+    hub.snapshot_download = lambda **kwargs: str(snapshot_path)
     from pseudonymizer.local_llm import QwenGenerator
 
     class FakeGenerator:
@@ -64,6 +87,7 @@ def _fake_model(monkeypatch, *, cuda_available: bool):
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "gliner2", gliner2)
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.setattr(Path, "symlink_to", lambda target_file, source_file: shutil.copyfile(source_file, target_file))
     return calls
 
 
@@ -77,44 +101,68 @@ def test_device_configuration_defaults_and_rejects_invalid_values(monkeypatch):
         get_device()
 
 
-def test_cpu_startup_skips_cuda_probe_and_reports_device(monkeypatch):
+def test_cpu_startup_skips_cuda_probe_and_reports_device(monkeypatch, tmp_path: Path):
     from fastapi.testclient import TestClient
     from pseudonymizer.app import create_app
 
     monkeypatch.setenv("DEVICE", "cpu")
     monkeypatch.setenv("HF_HOME", "/fake/cache")
-    calls = _fake_model(monkeypatch, cuda_available=False)
+    snapshot = tmp_path / "snapshot"
+    calls = _fake_model(monkeypatch, cuda_available=False, snapshot_path=snapshot)
     with TestClient(create_app()) as client:
         assert client.get("/health/ready").json() == {"ready": True, "device": "cpu"}
+    loads = calls.pop("loads")
     assert calls == {
         "cuda_checks": 0, "to": [], "eval": 1,
         "generator": ("cpu", "/fake/cache"),
-        "loads": [(('/fake/model-snapshot',), {"map_location": "cpu"})],
     }
+    assert len(loads) == 1
+    args, kwargs, normalized_config, tokenizer_json = loads[0]
+    assert Path(args[0]) != snapshot
+    assert kwargs == {"map_location": "cpu"}
+    assert normalized_config["additional_special_tokens"] == ["[BASE]", "[SEP_STRUCT]", "[SEP_TEXT]"]
+    assert "extra_special_tokens" not in normalized_config
+    assert tokenizer_json["added_tokens"] == [
+        {"id": 250102, "content": "[SEP_STRUCT]"},
+        {"id": 250103, "content": "[SEP_TEXT]"},
+    ]
+    assert json.loads((snapshot / "tokenizer_config.json").read_text(encoding="utf-8"))["extra_special_tokens"] == ["[SEP_STRUCT]", "[SEP_TEXT]"]
 
 
-def test_cuda_startup_uses_cuda_and_reports_device(monkeypatch):
+def test_cuda_startup_uses_cuda_and_reports_device(monkeypatch, tmp_path: Path):
     from fastapi.testclient import TestClient
     from pseudonymizer.app import create_app
 
     monkeypatch.setenv("DEVICE", "cuda")
     monkeypatch.setenv("HF_HOME", "/fake/cache")
-    calls = _fake_model(monkeypatch, cuda_available=True)
+    snapshot = tmp_path / "snapshot"
+    calls = _fake_model(monkeypatch, cuda_available=True, snapshot_path=snapshot)
     with TestClient(create_app()) as client:
         assert client.get("/health/ready").json() == {"ready": True, "device": "cuda"}
+    loads = calls.pop("loads")
     assert calls == {
         "cuda_checks": 1, "to": [], "eval": 1,
         "generator": ("cuda", "/fake/cache"),
-        "loads": [(('/fake/model-snapshot',), {"map_location": "cuda"})],
     }
+    assert len(loads) == 1
+    args, kwargs, normalized_config, tokenizer_json = loads[0]
+    assert Path(args[0]) != snapshot
+    assert kwargs == {"map_location": "cuda"}
+    assert normalized_config["additional_special_tokens"] == ["[BASE]", "[SEP_STRUCT]", "[SEP_TEXT]"]
+    assert "extra_special_tokens" not in normalized_config
+    assert tokenizer_json["added_tokens"] == [
+        {"id": 250102, "content": "[SEP_STRUCT]"},
+        {"id": 250103, "content": "[SEP_TEXT]"},
+    ]
+    assert json.loads((snapshot / "tokenizer_config.json").read_text(encoding="utf-8"))["extra_special_tokens"] == ["[SEP_STRUCT]", "[SEP_TEXT]"]
 
 
-def test_cuda_startup_fails_when_gpu_is_unavailable(monkeypatch):
+def test_cuda_startup_fails_when_gpu_is_unavailable(monkeypatch, tmp_path: Path):
     from fastapi.testclient import TestClient
     from pseudonymizer.app import create_app
 
     monkeypatch.setenv("DEVICE", "cuda")
-    calls = _fake_model(monkeypatch, cuda_available=False)
+    calls = _fake_model(monkeypatch, cuda_available=False, snapshot_path=tmp_path / "snapshot")
     with pytest.raises(RuntimeError, match="CUDA GPU is required"):
         with TestClient(create_app()):
             pass

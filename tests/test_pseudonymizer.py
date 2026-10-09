@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from pseudonymizer.local_llm import ContextLimitError
 from pseudonymizer.app import create_app
 from pseudonymizer.service import MappingStore, anonymize_text, restore_text
 
@@ -35,6 +36,26 @@ def test_mapping_store_expires_at_creation_and_unknown_ids_return_none():
     assert store.get(mapping_id) is None
     assert store.get("unknown") is None
     store.close()
+
+
+def test_person_context_limit_is_a_safe_client_error_without_raw_text():
+    source = "Мария Иванова попросила подготовить подробную справку."
+    detector = FakeDetector({source: [entity("Мария Иванова", "person name", source)]})
+
+    class OversizedPersonPipeline:
+        def link(self, _text, _spans):
+            raise ContextLimitError(45_123, 40_704, 40_960)
+
+    with TestClient(create_app(detector=detector, pipeline=OversizedPersonPipeline())) as client:
+        response = client.post("/anonymize", json={"text": source})
+
+    assert response.status_code == 413
+    body = response.json()
+    assert body["detail"] == {
+        "code": "local_model_context_exceeded", "input_tokens": 45_123,
+        "maximum_input_tokens": 40_704, "context_window": 40_960,
+    }
+    assert source not in response.text
 
 
 def test_repeated_unicode_values_share_marker_and_restore_once():

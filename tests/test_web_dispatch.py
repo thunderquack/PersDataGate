@@ -169,6 +169,57 @@ def test_pseudonymizer_failure_does_not_call_openai(monkeypatch):
     assert "secret raw value" not in response.text
 
 
+def test_local_model_context_limit_is_413_with_counts_guid_and_no_openai_call(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+    observed_pipeline_ids = []
+    pipeline_id = "f82179ed-25f4-4ef0-b5ff-27e38749b39b"
+
+    async def scenario():
+        pseudo_api = FastAPI()
+
+        @pseudo_api.post("/anonymize")
+        async def anonymize(request):
+            observed_pipeline_ids.append(request.headers.get("X-Pipeline-ID"))
+            return JSONResponse(status_code=413, content={"detail": {
+                "code": "local_model_context_exceeded", "input_tokens": 45_123,
+                "maximum_input_tokens": 40_704, "context_window": 40_960,
+            }})
+
+        pseudo_http = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=pseudo_api), base_url="http://pseudonymizer"
+        )
+        pseudo_client = PseudonymizerClient("http://pseudonymizer", client=pseudo_http)
+        openai = FakeOpenAI()
+        web_app = create_app(pseudonymizer=pseudo_client, openai_client=openai)
+        async with web_app.router.lifespan_context(web_app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=web_app), base_url="http://web"
+            ) as browser:
+                response = await browser.post(
+                    "/api/process", headers={"X-Pipeline-ID": pipeline_id},
+                    json={"prompt": "summarize", "document": "private source text"},
+                )
+        await pseudo_http.aclose()
+        return response, openai
+
+    response, openai = asyncio.run(scenario())
+    assert response.status_code == 413
+    body = response.json()
+    assert body["pipeline_id"] == pipeline_id
+    assert body["error"] == {
+        "stage": "anonymize", "code": "local_model_context_exceeded",
+        "message": "Документ и промпт превышают контекст локальной модели: 45123 токенов "
+                   "при лимите ввода 40704 (окно контекста 40960). Запрос в OpenAI не отправлен.",
+        "input_tokens": 45_123, "maximum_input_tokens": 40_704, "context_window": 40_960,
+    }
+    assert observed_pipeline_ids == [pipeline_id]
+    assert openai.responses.calls == []
+    assert body["prepared_text"] == ""
+    assert body["received_text"] == ""
+    assert "private source text" not in response.text
+
+
 def test_restore_failure_keeps_both_masked_request_and_received_answer(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_MODEL", "test-model")

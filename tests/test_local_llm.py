@@ -156,12 +156,13 @@ def test_does_not_truncate_or_generate_when_encoded_prompt_exceeds_model_context
     assert error_event["input_budget"] == 4096 - MAX_NEW_TOKENS
 
 
-def test_rejects_invalid_model_context_window(monkeypatch, tmp_path):
+@pytest.mark.parametrize("model_context", [0, MAX_NEW_TOKENS])
+def test_rejects_invalid_model_context_window(monkeypatch, tmp_path, model_context):
     mocked_transformers(
-        monkeypatch, response='{"relation":"same"}', model_context=0
+        monkeypatch, response='{"relation":"same"}', model_context=model_context
     )
 
-    with pytest.raises(ValueError, match="positive integer"):
+    with pytest.raises(ValueError, match="larger than the output budget"):
         QwenGenerator(device="cpu", cache_dir=tmp_path)
 
 

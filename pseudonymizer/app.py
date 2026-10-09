@@ -21,11 +21,13 @@ logger = logging.getLogger("uvicorn.error")
 
 class AnonymizeRequest(BaseModel):
     text: str = Field(max_length=MAX_TEXT_LENGTH)
+    include_steps: bool = False
 
 
 class DeanonymizeRequest(BaseModel):
     mapping_id: str
     text: str = Field(max_length=MAX_RESPONSE_LENGTH)
+    include_steps: bool = False
 
 
 class GLiNERDetector:
@@ -106,20 +108,25 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
         if not getattr(app.state, "ready", False):
             raise HTTPException(status_code=503, detail="model_not_ready")
         try:
+            steps: dict[str, Any] | None = {} if request.include_steps else None
             with app.state.inference_lock:
                 safe_text, mapping = anonymize_text(
-                    request.text, app.state.detector, getattr(app.state, "pipeline", None)
+                    request.text, app.state.detector, getattr(app.state, "pipeline", None),
+                    steps=steps,
                 )
         except Exception as exc:
             logger.error("Anonymization failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail="anonymization_failed") from exc
         mapping_id, expiration = app.state.store.create(mapping)
-        return {
+        response = {
             "mapping_id": mapping_id,
             "text": safe_text,
             "expires_at": expires_iso(expiration),
             "warnings": list(mapping.warnings),
         }
+        if steps is not None:
+            response["steps"] = steps
+        return response
 
     @app.post("/deanonymize")
     def deanonymize(request: DeanonymizeRequest) -> dict[str, Any]:
@@ -127,14 +134,19 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
         if mapping is None:
             raise HTTPException(status_code=404, detail="mapping_not_found")
         try:
+            steps: dict[str, Any] | None = {} if request.include_steps else None
             with app.state.inference_lock:
                 text, warnings = restore_text(
-                    request.text, mapping, getattr(app.state, "pipeline", None)
+                    request.text, mapping, getattr(app.state, "pipeline", None),
+                    steps=steps,
                 )
         except Exception as exc:
             logger.error("De-anonymization failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail="deanonymization_failed") from exc
-        return {"text": text, "warnings": warnings}
+        response = {"text": text, "warnings": warnings}
+        if steps is not None:
+            response["steps"] = steps
+        return response
 
     return app
 

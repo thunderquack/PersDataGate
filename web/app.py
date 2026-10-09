@@ -49,13 +49,16 @@ class PseudonymizerClient:
         self._owns_client = client is None
 
     async def anonymize(self, text: str) -> dict[str, Any]:
-        response = await self.client.post(f"{self.base_url}/anonymize", json={"text": text})
+        response = await self.client.post(
+            f"{self.base_url}/anonymize", json={"text": text, "include_steps": True}
+        )
         response.raise_for_status()
         return response.json()
 
     async def deanonymize(self, mapping_id: str, text: str) -> dict[str, Any]:
         response = await self.client.post(
-            f"{self.base_url}/deanonymize", json={"mapping_id": mapping_id, "text": text}
+            f"{self.base_url}/deanonymize",
+            json={"mapping_id": mapping_id, "text": text, "include_steps": True}
         )
         response.raise_for_status()
         return response.json()
@@ -91,6 +94,8 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
             "error": {"stage": exc.stage, "code": exc.code, "message": exc.message},
             "prepared_text": exc.prepared, "received_text": exc.received,
             "sent_request": exc.sent_request,
+            "steps": getattr(request.state, "processing_steps", {}),
+            "warnings": getattr(request.state, "processing_warnings", []),
         })
 
     @app.get("/", response_class=HTMLResponse)
@@ -106,6 +111,8 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
 
     @app.post("/api/process")
     async def process(body: ProcessRequest, request: Request):
+        request.state.processing_steps = {}
+        request.state.processing_warnings = []
         combined = f"[ПРОМПТ]\n{body.prompt}\n\n[ДОКУМЕНТ]\n{body.document}"
         if len(body.prompt) + len(body.document) > MAX_INPUT_CHARS or len(combined) > MAX_INPUT_CHARS:
             return JSONResponse(status_code=413, content={"error": {
@@ -119,6 +126,9 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
         try:
             anonymized = await request.app.state.pseudonymizer.anonymize(combined)
             mapping_id, prepared = anonymized["mapping_id"], anonymized["text"]
+            request.state.processing_steps.update(anonymized.get("steps", {}))
+            request.state.processing_steps["anonymized_text"] = prepared
+            request.state.processing_warnings = anonymized.get("warnings", [])
         except Exception:
             raise ApiError("anonymize", "pseudonymizer_unavailable",
                            "Не удалось псевдонимизировать текст. Запрос в OpenAI не отправлен.") from None
@@ -155,6 +165,7 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
         try:
             restored = await request.app.state.pseudonymizer.deanonymize(mapping_id, received)
             restored_text = restored["text"]
+            request.state.processing_steps.update(restored.get("steps", {}))
             warnings = list(dict.fromkeys(anonymized.get("warnings", []) + restored.get("warnings", [])))
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
@@ -169,7 +180,8 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
                            "Ответ получен, но восстановить исходные значения не удалось.",
                            prepared=prepared, received=received, sent_request=sent_request) from None
         return {"sent_request": sent_request, "received_text": received,
-                "restored_text": restored_text, "warnings": warnings}
+                "restored_text": restored_text, "warnings": warnings,
+                "steps": request.state.processing_steps}
 
     return app
 

@@ -197,3 +197,42 @@ def test_rich_person_mapping_api_restoration_warning_and_ttl():
         assert len(result.json()["warnings"]) == 2
         clock[0] = 5
         assert client.post("/deanonymize", json={"mapping_id": masked["mapping_id"], "text": masked["text"]}).status_code == 404
+
+
+def test_opt_in_steps_capture_entities_clusters_and_occurrence_forms():
+    from pseudonymizer.persons import PersonRecord
+
+    source = "Иван Петров; Ивана Петрова; a@example.org"
+    detector = FakeDetector({source: [entity(value, "person name", source)
+                                     for value in ("Иван Петров", "Ивана Петрова")]})
+
+    class Pipeline:
+        def link(self, text, spans):
+            record = PersonRecord("one", "Иван Петров", tuple(span.value for span in spans))
+            return {span.start: record for span in spans}, []
+
+        def restore(self, text, marker, record, start, end):
+            return "Ивану Петрову" if start == 0 else None
+
+    with TestClient(create_app(detector=detector, pipeline=Pipeline())) as client:
+        default = client.post("/anonymize", json={"text": source}).json()
+        assert "steps" not in default
+        traced = client.post("/anonymize", json={"text": source, "include_steps": True}).json()
+        steps = traced["steps"]
+        assert [item["source"] for item in steps["entities"]] == ["gliner", "gliner", "rule"]
+        assert steps["persons"][0]["aliases"] == ["Иван Петров", "Ивана Петрова"]
+        assert len(steps["persons"][0]["mentions"]) == 2
+        assert steps["anonymized_text"] == traced["text"]
+        marker = steps["persons"][0]["marker"]
+        answer = f"{marker} и {marker} ⟦unknown⟧"
+        restored = client.post("/deanonymize", json={
+            "mapping_id": traced["mapping_id"], "text": answer, "include_steps": True
+        }).json()
+        occurrences = restored["steps"]["restorations"]
+        assert [item["status"] for item in occurrences] == ["restored", "uncertain", "unknown"]
+        assert occurrences[0]["value"] == "Ивану Петрову"
+        assert occurrences[1]["value"] is None
+        # Each response trace is fresh; the original private mapping stays usable.
+        repeated = client.post("/deanonymize", json={"mapping_id": traced["mapping_id"], "text": marker}).json()
+        assert "steps" not in repeated
+        assert repeated["text"] == "Ивану Петрову"

@@ -259,8 +259,20 @@ def find_spans(text: str, model: Any) -> list[Span]:
     return sorted(selected, key=lambda s: s.start)
 
 
-def anonymize_text(text: str, model: Any, pipeline: Any | None = None) -> tuple[str, PseudonymMapping]:
+def anonymize_text(text: str, model: Any, pipeline: Any | None = None, *,
+                   steps: dict[str, Any] | None = None) -> tuple[str, PseudonymMapping]:
     spans = find_spans(text, model)
+    if steps is not None:
+        steps["entities"] = [
+            {
+                "start": span.start,
+                "end": span.end,
+                "value": span.value,
+                "code": span.code,
+                "source": "rule" if span.rule else "gliner",
+            }
+            for span in spans
+        ]
     mapping = PseudonymMapping()
     value_markers: dict[tuple[str, str], str] = {}
     nonce = uuid.uuid4().hex
@@ -298,18 +310,47 @@ def anonymize_text(text: str, model: Any, pipeline: Any | None = None) -> tuple[
         pieces.extend((text[cursor : span.start], marker))
         cursor = span.end
     pieces.append(text[cursor:])
-    return "".join(pieces), mapping
+    anonymized_text = "".join(pieces)
+    if steps is not None:
+        mentions_by_marker: dict[str, list[dict[str, Any]]] = {}
+        for span in spans:
+            record = assignments.get(span.start) if span.code == "PERSON" else None
+            if record is None:
+                continue
+            marker = value_markers.get(("PERSON_ID", record.identifier))
+            if marker is not None:
+                mentions_by_marker.setdefault(marker, []).append({
+                    "start": span.start, "end": span.end, "value": span.value,
+                })
+        steps["persons"] = [
+            {
+                "marker": marker,
+                "canonical": record.canonical,
+                "aliases": list(record.aliases),
+                "mentions": mentions_by_marker.get(marker, []),
+            }
+            for marker, record in mapping.persons.items()
+        ]
+        steps["anonymized_text"] = anonymized_text
+    return anonymized_text, mapping
 
 
 _MARKER = re.compile(r"⟦[^⟦⟧]{1,120}⟧")
 
 
-def restore_text(text: str, mapping: dict[str, str], pipeline: Any | None = None) -> tuple[str, list[str]]:
+def restore_text(text: str, mapping: dict[str, str], pipeline: Any | None = None, *,
+                 steps: dict[str, Any] | None = None) -> tuple[str, list[str]]:
     warnings: list[str] = list(getattr(mapping, "warnings", []))
     known = set(mapping)
-    for marker in _MARKER.findall(text):
+    occurrences: list[dict[str, Any]] = []
+    for match in _MARKER.finditer(text):
+        marker = match.group(0)
         if marker not in known:
             warnings.append(f"Unknown marker left unchanged: {marker}")
+            occurrences.append({
+                "marker": marker, "start": match.start(), "end": match.end(),
+                "value": None, "status": "unknown",
+            })
     # Single pass avoids interpreting text restored from a source value.
     persons = getattr(mapping, "persons", {})
 
@@ -319,17 +360,34 @@ def restore_text(text: str, mapping: dict[str, str], pipeline: Any | None = None
             return marker
         record = persons.get(marker)
         if record is None or pipeline is None:
-            return mapping[marker]
+            value = mapping[marker]
+            occurrences.append({
+                "marker": marker, "start": match.start(), "end": match.end(),
+                "value": value, "status": "restored",
+            })
+            return value
         try:
             value = pipeline.restore(text, marker, record, match.start(), match.end())
         except Exception:
             value = None
         if value is None:
             warnings.append("Could not safely inflect a person name; marker left unchanged.")
+            occurrences.append({
+                "marker": marker, "start": match.start(), "end": match.end(),
+                "value": None, "status": "uncertain",
+            })
             return marker
+        occurrences.append({
+            "marker": marker, "start": match.start(), "end": match.end(),
+            "value": value, "status": "restored",
+        })
         return value
 
     restored = _MARKER.sub(replace, text)
+    if steps is not None:
+        # Each invocation produces a fresh trace. Caller mappings and stored
+        # restoration state remain untouched.
+        steps["restorations"] = sorted(occurrences, key=lambda item: item["start"])
     return restored, warnings
 
 

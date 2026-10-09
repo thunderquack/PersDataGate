@@ -82,6 +82,35 @@ def test_local_model_timeout_is_separate_from_openai(monkeypatch):
     asyncio.run(client.close())
 
 
+def test_intermediate_steps_are_local_and_survive_openai_failure(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+    steps = {"entities": [{"value": "Private Name", "code": "PERSON"}],
+             "persons": [{"canonical": "Private Name", "aliases": ["Private Name"]}]}
+
+    class StepClient(FakePseudonymizer):
+        async def anonymize(self, text):
+            return {"mapping_id": "opaque", "text": "masked", "steps": steps, "warnings": ["uncertain link"]}
+
+        async def deanonymize(self, mapping_id, text):
+            return {"text": "restored", "steps": {"restorations": [{"value": "Private Name", "status": "restored"}]}}
+
+    for failure in (False, True):
+        openai = FakeOpenAI(fail=failure)
+        with TestClient(create_app(pseudonymizer=StepClient(), openai_client=openai)) as client:
+            response = client.post("/api/process", json={"document": "Private Name"})
+        body = response.json()
+        assert body["steps"]["entities"] == steps["entities"]
+        assert body["steps"]["anonymized_text"] == "masked"
+        assert "Private Name" not in repr(openai.responses.calls)
+        assert "steps" not in repr(openai.responses.calls)
+        if failure:
+            assert body["warnings"] == ["uncertain link"]
+            assert "restorations" not in body["steps"]
+        else:
+            assert body["steps"]["restorations"][0]["value"] == "Private Name"
+
+
 def test_dispatch_sends_only_masked_text_and_restores_response(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_MODEL", "test-model")

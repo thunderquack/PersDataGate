@@ -1,0 +1,97 @@
+[
+  {
+    "id": "ru_declensions_initials_full_name",
+    "language": "ru",
+    "source": "Участник A: Иван Петров; конец A. Участник B: Ивана Петрова; конец B. Участник C: И. Петров; конец C. Фамилия участника A: Петров; конец F.",
+    "mentions": [
+      {"id": "ivan_nom", "before": "Участник A: ", "after": "; конец A"},
+      {"id": "ivan_gen", "before": "Участник B: ", "after": "; конец B"},
+      {"id": "ivan_initial", "before": "Участник C: ", "after": "; конец C"},
+      {"id": "ivan_surname_only", "before": "Фамилия участника A: ", "after": "; конец F"}
+    ],
+    "links": [
+      {"left": "ivan_nom", "right": "ivan_gen", "relation": "same"},
+      {"left": "ivan_nom", "right": "ivan_initial", "relation": "same"},
+      {"left": "ivan_nom", "right": "ivan_surname_only", "relation": "same"}
+    ],
+    "restorations": [
+      {"id": "ru_dative", "mention": "ivan_nom", "template": "Передали {marker} документы.", "expected": "Передали Ивану Петрову документы."},
+      {"id": "ru_genitive", "mention": "ivan_nom", "template": "Нет {marker} в списке.", "expected": "Нет Ивана Петрова в списке."}
+    ]
+  },
+  {
+    "id": "ru_patronymic_orders",
+    "language": "ru",
+    "source": "Форма A: Иван Петров Иванович; конец patronymic-last. Форма B: Иван Иванович Петров; конец patronymic-middle.",
+    "mentions": [
+      {"id": "patronymic_last", "before": "Форма A: ", "after": "; конец patronymic-last"},
+      {"id": "patronymic_middle", "before": "Форма B: ", "after": "; конец patronymic-middle"}
+    ],
+    "links": [
+      {"left": "patronymic_last", "right": "patronymic_middle", "relation": "same"}
+    ]
+  },
+  {
+    "id": "ru_ambiguous_initial",
+    "language": "ru",
+    "source": "Первый: Иван Петров; конец first. Второй: Игорь Петров; конец second. Ссылка: И. Петров; конец initial.",
+    "mentions": [
+      {"id": "ivan", "before": "Первый: ", "after": "; конец first"},
+      {"id": "igor", "before": "Второй: ", "after": "; конец second"},
+      {"id": "initial", "before": "Ссылка: ", "after": "; конец initial"}
+    ],
+    "links": [
+      {"left": "ivan", "right": "igor", "relation": "different"},
+      {"left": "ivan", "right": "initial", "relation": "different"},
+      {"left": "igor", "right": "initial", "relation": "different"}
+    ],
+    "warning_contains": ["ambiguous"]
+  },
+  {
+    "id": "ru_same_spelling_different_departments",
+    "language": "ru",
+    "source": "Отдел A: сотрудник 1 Иван Петров. Отдел B: другой сотрудник 2 Иван Петров. Это разные люди; конец A и конец B.",
+    "mentions": [
+      {"id": "dept_a", "before": "Отдел A: сотрудник 1 ", "after": ". Отдел B"},
+      {"id": "dept_b", "before": "другой сотрудник 2 ", "after": ". Это разные люди"}
+    ],
+    "links": [
+      {"left": "dept_a", "right": "dept_b", "relation": "different"}
+    ]
+  },
+  {
+    "id": "ru_woman_inflected_forms",
+    "language": "ru",
+    "source": "Заявительница: Мария Иванова; конец applicant. Повторно о заявительнице: Марии Ивановой; конец repeat.",
+    "mentions": [
+      {"id": "maria_one", "before": "Заявительница: ", "after": "; конец applicant"},
+      {"id": "maria_two", "before": "Повторно о заявительнице: ", "after": "; конец repeat"}
+    ],
+    "links": [
+      {"left": "maria_one", "right": "maria_two", "relation": "same"}
+    ],
+    "restorations": [
+      {"id": "ru_woman_dative", "mention": "maria_one", "template": "Письмо адресовано {marker}.", "expected": "Письмо адресовано Марии Ивановой."},
+      {"id": "ru_woman_genitive", "mention": "maria_one", "template": "Документы {marker} приложены.", "expected": "Документы Марии Ивановой приложены."}
+    ]
+  },
+  {
+    "id": "de_initial_full_and_possessive",
+    "language": "de",
+    "source": "Vollname: Max Müller; Ende full. Kurzform: M. Müller; Ende initial.",
+    "mentions": [
+      {"id": "max_full", "before": "Vollname: ", "after": "; Ende full"},
+      {"id": "max_initial", "before": "Kurzform: ", "after": "; Ende initial"}
+    ],
+    "links": [
+      {"left": "max_full", "right": "max_initial", "relation": "same"}
+    ],
+    "restorations": [
+      {"id": "de_possessive", "mention": "max_full", "template": "Das ist {marker} Bericht.", "expected": "Das ist Max Müllers Bericht."}
+    ],
+    "unknown_marker": {
+      "marker": "⟦PERSON_unknown_999⟧",
+      "text": "Unbekannt: ⟦PERSON_unknown_999⟧."
+    }
+  }
+]

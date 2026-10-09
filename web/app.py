@@ -43,7 +43,9 @@ class ApiError(Exception):
 class PseudonymizerClient:
     def __init__(self, base_url: str, client: httpx.AsyncClient | None = None):
         self.base_url = base_url.rstrip("/")
-        self.client = client or httpx.AsyncClient(timeout=TIMEOUT_SECONDS)
+        self.client = client or httpx.AsyncClient(
+            timeout=float(os.getenv("PSEUDONYMIZER_TIMEOUT_SECONDS", "600"))
+        )
         self._owns_client = client is None
 
     async def anonymize(self, text: str) -> dict[str, Any]:
@@ -152,7 +154,8 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
                            prepared=prepared, sent_request=sent_request) from None
         try:
             restored = await request.app.state.pseudonymizer.deanonymize(mapping_id, received)
-            restored_text, warnings = restored["text"], restored.get("warnings", [])
+            restored_text = restored["text"]
+            warnings = list(dict.fromkeys(anonymized.get("warnings", []) + restored.get("warnings", [])))
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 raise ApiError("deanonymize", "mapping_not_found",

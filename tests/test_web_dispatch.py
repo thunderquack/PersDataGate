@@ -56,6 +56,32 @@ class FakeOpenAI:
         self.responses = FakeResponses(**kwargs)
 
 
+def test_link_and_restore_warnings_are_combined_without_sending_them(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+
+    class WarningClient(FakePseudonymizer):
+        async def anonymize(self, text):
+            return {"mapping_id": "opaque", "text": "masked", "warnings": ["ambiguous"]}
+
+        async def deanonymize(self, mapping_id, text):
+            return {"text": "restored", "warnings": ["ambiguous", "uncertain form"]}
+
+    openai = FakeOpenAI()
+    with TestClient(create_app(pseudonymizer=WarningClient(), openai_client=openai)) as client:
+        response = client.post("/api/process", json={"document": "private", "prompt": "summarize"})
+    assert response.json()["warnings"] == ["ambiguous", "uncertain form"]
+    assert "ambiguous" not in repr(openai.responses.calls)
+
+
+def test_local_model_timeout_is_separate_from_openai(monkeypatch):
+    monkeypatch.setenv("PSEUDONYMIZER_TIMEOUT_SECONDS", "780")
+    client = PseudonymizerClient("http://example.test")
+    assert client.client.timeout.read == 780
+    assert TIMEOUT_SECONDS == 120
+    asyncio.run(client.close())
+
+
 def test_dispatch_sends_only_masked_text_and_restores_response(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_MODEL", "test-model")

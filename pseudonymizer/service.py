@@ -91,6 +91,15 @@ class Span:
     rule: bool = False
 
 
+class PseudonymMapping(dict[str, str]):
+    """Legacy marker mapping with private person records and safe warnings."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.persons: dict[str, Any] = {}
+        self.warnings: list[str] = []
+
+
 def _expand_contextual_address(text: str, span: Span) -> Span:
     """Include a nearby city/postcode only inside an explicit address phrase."""
     if span.code != "ADDRESS":
@@ -250,22 +259,42 @@ def find_spans(text: str, model: Any) -> list[Span]:
     return sorted(selected, key=lambda s: s.start)
 
 
-def anonymize_text(text: str, model: Any) -> tuple[str, dict[str, str]]:
+def anonymize_text(text: str, model: Any, pipeline: Any | None = None) -> tuple[str, PseudonymMapping]:
     spans = find_spans(text, model)
-    mapping: dict[str, str] = {}
-    value_markers: dict[str, str] = {}
+    mapping = PseudonymMapping()
+    value_markers: dict[tuple[str, str], str] = {}
     nonce = uuid.uuid4().hex
     pieces: list[str] = []
     cursor = 0
     counters: dict[str, int] = {}
+    assignments: dict[int, Any] = {}
+    if pipeline is not None:
+        person_spans = [span for span in spans if span.code == "PERSON"]
+        if person_spans:
+            linked, warnings = pipeline.link(text, person_spans)
+            if set(linked) != {span.start for span in person_spans}:
+                raise RuntimeError("Incomplete person assignments")
+            assignments = linked
+            mapping.warnings.extend(warnings)
     for span in spans:
-        if span.value in value_markers:
-            marker = value_markers[span.value]
+        record = assignments.get(span.start) if span.code == "PERSON" else None
+        if record is not None:
+            marker = value_markers.get(("PERSON_ID", record.identifier))
+            if marker is None:
+                counters["PERSON"] = counters.get("PERSON", 0) + 1
+                marker = f"⟦PERSON_{nonce}_{counters['PERSON']}⟧"
+                value_markers[("PERSON_ID", record.identifier)] = marker
+                mapping[marker] = record.canonical
+                mapping.persons[marker] = record
         else:
-            counters[span.code] = counters.get(span.code, 0) + 1
-            marker = f"⟦{span.code}_{nonce}_{counters[span.code]}⟧"
-            value_markers[span.value] = marker
-            mapping[marker] = span.value
+            key = (span.code, span.value)
+            if key in value_markers:
+                marker = value_markers[key]
+            else:
+                counters[span.code] = counters.get(span.code, 0) + 1
+                marker = f"⟦{span.code}_{nonce}_{counters[span.code]}⟧"
+                value_markers[key] = marker
+                mapping[marker] = span.value
         pieces.extend((text[cursor : span.start], marker))
         cursor = span.end
     pieces.append(text[cursor:])
@@ -275,14 +304,32 @@ def anonymize_text(text: str, model: Any) -> tuple[str, dict[str, str]]:
 _MARKER = re.compile(r"⟦[^⟦⟧]{1,120}⟧")
 
 
-def restore_text(text: str, mapping: dict[str, str]) -> tuple[str, list[str]]:
-    warnings: list[str] = []
+def restore_text(text: str, mapping: dict[str, str], pipeline: Any | None = None) -> tuple[str, list[str]]:
+    warnings: list[str] = list(getattr(mapping, "warnings", []))
     known = set(mapping)
     for marker in _MARKER.findall(text):
         if marker not in known:
             warnings.append(f"Unknown marker left unchanged: {marker}")
     # Single pass avoids interpreting text restored from a source value.
-    restored = _MARKER.sub(lambda match: mapping.get(match.group(0), match.group(0)), text)
+    persons = getattr(mapping, "persons", {})
+
+    def replace(match: re.Match[str]) -> str:
+        marker = match.group(0)
+        if marker not in known:
+            return marker
+        record = persons.get(marker)
+        if record is None or pipeline is None:
+            return mapping[marker]
+        try:
+            value = pipeline.restore(text, marker, record, match.start(), match.end())
+        except Exception:
+            value = None
+        if value is None:
+            warnings.append("Could not safely inflect a person name; marker left unchanged.")
+            return marker
+        return value
+
+    restored = _MARKER.sub(replace, text)
     return restored, warnings
 
 

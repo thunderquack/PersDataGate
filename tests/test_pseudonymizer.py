@@ -152,3 +152,48 @@ def test_api_round_trip_ttl_and_mapping_isolation():
         unknown = client.post("/deanonymize", json={"mapping_id": "missing", "text": "hello"})
         assert unknown.status_code == 404
     store.close()
+
+
+def test_person_pipeline_failures_and_incomplete_assignments_fail_closed():
+    source = "Иван Петров"
+    detector = FakeDetector({source: [entity(source, "person name", source)]})
+
+    class IncompletePipeline:
+        def link(self, text, spans):
+            return {}, []
+
+    class FailedPipeline:
+        def link(self, text, spans):
+            raise RuntimeError("sensitive local prompt")
+
+    for pipeline in (IncompletePipeline(), FailedPipeline()):
+        with TestClient(create_app(detector=detector, pipeline=pipeline)) as client:
+            response = client.post("/anonymize", json={"text": source})
+        assert response.status_code == 503
+        assert response.json() == {"detail": "anonymization_failed"}
+
+
+def test_rich_person_mapping_api_restoration_warning_and_ttl():
+    from pseudonymizer.persons import PersonRecord
+
+    source = "Иван Петров"
+    detector = FakeDetector({source: [entity(source, "person name", source)]})
+    clock = [0.0]
+    store = MappingStore(ttl_seconds=5, clock=lambda: clock[0])
+
+    class Pipeline:
+        def link(self, text, spans):
+            return {spans[0].start: PersonRecord("one", source, (source,))}, ["link warning"]
+
+        def restore(self, *args):
+            return None
+
+    with TestClient(create_app(detector=detector, store=store, pipeline=Pipeline())) as client:
+        masked = client.post("/anonymize", json={"text": source}).json()
+        assert masked["warnings"] == ["link warning"]
+        assert source not in str(masked)
+        result = client.post("/deanonymize", json={"mapping_id": masked["mapping_id"], "text": masked["text"]})
+        assert result.json()["text"] == masked["text"]
+        assert len(result.json()["warnings"]) == 2
+        clock[0] = 5
+        assert client.post("/deanonymize", json={"mapping_id": masked["mapping_id"], "text": masked["text"]}).status_code == 404

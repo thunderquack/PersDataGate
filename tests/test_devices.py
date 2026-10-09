@@ -47,6 +47,16 @@ def _fake_model(monkeypatch, *, cuda_available: bool):
     gliner.GLiNER = types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: model)
     hub = types.ModuleType("huggingface_hub")
     hub.snapshot_download = lambda **kwargs: "/fake/model-snapshot"
+    from pseudonymizer.local_llm import QwenGenerator
+
+    class FakeGenerator:
+        def __init__(self, device, cache_dir):
+            calls["generator"] = (device, cache_dir)
+
+    monkeypatch.setattr("pseudonymizer.local_llm.QwenGenerator", FakeGenerator)
+    persons = types.ModuleType("pseudonymizer.persons")
+    persons.PersonPipeline = lambda generator: types.SimpleNamespace(generator=generator)
+    monkeypatch.setitem(sys.modules, "pseudonymizer.persons", persons)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "gliner", gliner)
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
@@ -68,10 +78,14 @@ def test_cpu_startup_skips_cuda_probe_and_reports_device(monkeypatch):
     from pseudonymizer.app import create_app
 
     monkeypatch.setenv("DEVICE", "cpu")
+    monkeypatch.setenv("HF_HOME", "/fake/cache")
     calls = _fake_model(monkeypatch, cuda_available=False)
     with TestClient(create_app()) as client:
         assert client.get("/health/ready").json() == {"ready": True, "device": "cpu"}
-    assert calls == {"cuda_checks": 0, "to": ["cpu"], "eval": 1}
+    assert calls == {
+        "cuda_checks": 0, "to": ["cpu"], "eval": 1,
+        "generator": ("cpu", "/fake/cache"),
+    }
 
 
 def test_cuda_startup_uses_cuda_and_reports_device(monkeypatch):
@@ -79,10 +93,14 @@ def test_cuda_startup_uses_cuda_and_reports_device(monkeypatch):
     from pseudonymizer.app import create_app
 
     monkeypatch.setenv("DEVICE", "cuda")
+    monkeypatch.setenv("HF_HOME", "/fake/cache")
     calls = _fake_model(monkeypatch, cuda_available=True)
     with TestClient(create_app()) as client:
         assert client.get("/health/ready").json() == {"ready": True, "device": "cuda"}
-    assert calls == {"cuda_checks": 1, "to": ["cuda"], "eval": 1}
+    assert calls == {
+        "cuda_checks": 1, "to": ["cuda"], "eval": 1,
+        "generator": ("cuda", "/fake/cache"),
+    }
 
 
 def test_cuda_startup_fails_when_gpu_is_unavailable(monkeypatch):

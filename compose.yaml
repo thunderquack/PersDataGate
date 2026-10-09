@@ -31,6 +31,7 @@ services:
       - "127.0.0.1:${WEB_PORT:-8090}:8000"
     environment:
       PSEUDONYMIZER_URL: http://pseudonymizer:8000
+      PSEUDONYMIZER_TIMEOUT_SECONDS: ${PSEUDONYMIZER_TIMEOUT_SECONDS:-600}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
     depends_on:

@@ -21,16 +21,16 @@ RUN if [ "${DEVICE}" = "cpu" ]; then \
 
 # Keep direct dependencies in individual layers so Docker can reuse the
 # unchanged package installs when one dependency changes.
-RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "fastapi==0.115.12"
-RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "uvicorn[standard]==0.34.2"
-RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "pydantic==2.11.4"
-RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "transformers==4.51.3"
-RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "huggingface-hub==0.30.2"
-RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "tokenizers==0.21.1"
-RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "hf-xet==1.3.0"
-RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "pymorphy3==2.0.3"
-RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "peft==0.15.2"
-RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "gliner2[local]==2.0.0"
+RUN python -m pip install --no-cache-dir "fastapi==0.115.12"
+RUN python -m pip install --no-cache-dir "uvicorn[standard]==0.34.2"
+RUN python -m pip install --no-cache-dir "pydantic==2.11.4"
+RUN python -m pip install --no-cache-dir "transformers==4.51.3"
+RUN python -m pip install --no-cache-dir "huggingface-hub==0.30.2"
+RUN python -m pip install --no-cache-dir "tokenizers==0.21.1"
+RUN python -m pip install --no-cache-dir "hf-xet==1.3.0"
+RUN python -m pip install --no-cache-dir "pymorphy3==2.0.3"
+RUN python -m pip install --no-cache-dir "peft==0.15.2"
+RUN python -m pip install --no-cache-dir "gliner2[local]==2.0.0"
 
 # Freeze the actual CPU/CUDA baseline to constrain optional runtime packages.
 RUN python -m pip check \

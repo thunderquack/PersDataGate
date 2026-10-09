@@ -8,12 +8,32 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install the large, device-specific dependency set in a reusable image layer.
-COPY pseudonymizer/dependencies.py /app/pseudonymizer/dependencies.py
-COPY pseudonymizer/__init__.py /app/pseudonymizer/__init__.py
-COPY pseudonymizer/requirements.${DEVICE}.txt /app/base-requirements.txt
-RUN python -m pseudonymizer.dependencies --device "${DEVICE}" --requirements /app/base-requirements.txt \
-    && python -m pip check \
+# Install the selected PyTorch build first; its matching CUDA runtime wheels
+# are resolved from PyPI when needed, while the exact torch variant comes from
+# the official device-specific index.
+RUN if [ "${DEVICE}" = "cpu" ]; then \
+        python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple "torch==2.7.1+cpu"; \
+    elif [ "${DEVICE}" = "cuda" ]; then \
+        python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 --extra-index-url https://pypi.org/simple "torch==2.7.1+cu128"; \
+    else \
+        echo "Unsupported DEVICE: ${DEVICE}" >&2; exit 1; \
+    fi
+
+# Keep direct dependencies in individual layers so Docker can reuse the
+# unchanged package installs when one dependency changes.
+RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "fastapi==0.115.12"
+RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "uvicorn[standard]==0.34.2"
+RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "pydantic==2.11.4"
+RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "transformers==4.51.3"
+RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "huggingface-hub==0.30.2"
+RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "tokenizers==0.21.1"
+RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "hf-xet==1.3.0"
+RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "pymorphy3==2.0.3"
+RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "peft==0.15.2"
+RUN python -m pip install --no-cache-dir --index-url https://pypi.org/simple "gliner2[local]==2.0.0"
+
+# Freeze the actual CPU/CUDA baseline to constrain optional runtime packages.
+RUN python -m pip check \
     && python -m pip freeze --all > /app/base-constraints.txt
 
 # The small, optional delta can be supplied at build time or mounted by Compose.

@@ -156,58 +156,55 @@ def test_ambiguous_initial_does_not_join_two_aliases_of_one_candidate():
     assert warnings
 
 
-def test_ambiguous_initial_stays_separate_even_if_generator_says_same():
+def test_model_same_links_ambiguous_initial_without_linguistic_filter():
     text = "Иван Петров, Игорь Петров и И. Петров"
     spans = person_spans(text, "Иван Петров", "Игорь Петров", "И. Петров")
-    records, warnings = PersonPipeline(
-        ScriptedGenerator(link="same"), morph=FakeMorph()
-    ).link(text, spans)
+    generator = ScriptedGenerator(link="same")
+    records, warnings = PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
 
-    assert len({record.identifier for record in records.values()}) == 3
-    assert warnings
+    assert len({record.identifier for record in records.values()}) == 1
+    assert warnings == []
+    assert len(generator.link_calls) == 3
 
 
-def test_surname_only_ambiguous_between_two_full_names_stays_separate():
+def test_model_same_links_surname_only_mentions_without_linguistic_filter():
     text = "Иван Петров, Игорь Петров, Петров"
     spans = person_spans(text, "Иван Петров", "Игорь Петров", "Петров")
     generator = ScriptedGenerator(link="same")
     records, _ = PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
 
-    assert len({record.identifier for record in records.values()}) == 3
-    assert records[spans[0].start].identifier != records[spans[1].start].identifier
-    assert records[spans[2].start].identifier not in {
-        records[spans[0].start].identifier, records[spans[1].start].identifier
-    }
+    assert len({record.identifier for record in records.values()}) == 1
+    assert len(generator.link_calls) == 3
 
 
-def test_initial_with_wrong_first_letter_does_not_link_to_full_name():
+def test_model_same_links_initial_with_different_first_letter():
     text = "Иван Петров, А. Петров"
     spans = person_spans(text, "Иван Петров", "А. Петров")
     generator = ScriptedGenerator(link="same")
     records, _ = PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
 
-    assert records[spans[0].start].identifier != records[spans[1].start].identifier
-    assert generator.link_calls == []
+    assert records[spans[0].start].identifier == records[spans[1].start].identifier
+    assert len(generator.link_calls) == 1
 
 
-def test_conflicting_patronymics_are_never_offered_as_link_candidates():
+def test_conflicting_patronymics_are_offered_and_model_same_is_respected():
     text = "Иван Иванович Петров и Иван Петрович Петров"
     spans = person_spans(text, "Иван Иванович Петров", "Иван Петрович Петров")
     generator = ScriptedGenerator(link="same")
     records, _ = PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
 
-    assert len({record.identifier for record in records.values()}) == 2
-    assert generator.link_calls == []
+    assert len({record.identifier for record in records.values()}) == 1
+    assert len(generator.link_calls) == 1
 
 
-def test_conflicting_patronymics_are_checked_in_family_name_first_order_too():
+def test_family_name_first_conflicting_patronymics_are_offered_to_model():
     text = "Петров Иван Иванович и Петров Иван Петрович"
     spans = person_spans(text, "Петров Иван Иванович", "Петров Иван Петрович")
     generator = ScriptedGenerator(link="same")
     records, _ = PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
 
-    assert len({record.identifier for record in records.values()}) == 2
-    assert generator.link_calls == []
+    assert len({record.identifier for record in records.values()}) == 1
+    assert len(generator.link_calls) == 1
 
 
 def test_explicit_same_spelling_can_represent_different_people():
@@ -221,20 +218,84 @@ def test_explicit_same_spelling_can_represent_different_people():
     assert records[spans[0].start].identifier != records[spans[1].start].identifier
 
 
-def test_conflicting_pair_prevents_a_transitive_same_relation_from_merging():
-    text = "Иван Петров, Ивана Петрова, И. Петров"
-    spans = person_spans(text, "Иван Петров", "Ивана Петрова", "И. Петров")
+def test_all_unordered_person_pairs_reach_model_once_including_initials_surnames_and_repeats():
+    text = "Irene Blake; I. Blake; Blake; Irene Blake; Ada Lovelace; 0300 555 0100; 10 Oak Road"
+    values = ["Irene Blake", "I. Blake", "Blake", "Irene Blake", "Ada Lovelace"]
+    spans = person_spans(text, *values)
+    phone_start = text.index("0300 555 0100")
+    address_start = text.index("10 Oak Road")
+    spans.extend([
+        Span(phone_start, phone_start + len("0300 555 0100"), "0300 555 0100", "PHONE", 0.99),
+        Span(address_start, address_start + len("10 Oak Road"), "10 Oak Road", "ADDRESS", 0.99),
+    ])
+    generator = ScriptedGenerator(link="unknown")
 
-    def relation(payload):
-        pair = {payload["left"]["mention"], payload["right"]["mention"]}
-        return "different" if pair == {"Ивана Петрова", "И. Петров"} else "same"
+    PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
 
-    records, warnings = PersonPipeline(
-        ScriptedGenerator(link=relation), morph=FakeMorph()
-    ).link(text, spans)
+    expected = {
+        tuple(sorted((spans[i].start, spans[j].start)))
+        for i in range(len(values)) for j in range(i + 1, len(values))
+    }
+    actual = [
+        tuple(sorted((payload["left"]["start"], payload["right"]["start"])))
+        for payload in generator.link_calls
+    ]
+    assert len(actual) == len(expected)
+    assert len(set(actual)) == len(actual)
+    assert set(actual) == expected
+    assert all(
+        payload["document"] == text
+        and text[payload["left"]["start"]:payload["left"]["end"]] == payload["left"]["mention"]
+        and text[payload["right"]["start"]:payload["right"]["end"]] == payload["right"]["mention"]
+        for payload in generator.link_calls
+    )
+
+
+def test_dissimilar_names_are_merged_when_model_says_same():
+    text = "Irene Blake and Ada Lovelace"
+    spans = person_spans(text, "Irene Blake", "Ada Lovelace")
+    generator = ScriptedGenerator(link="same")
+
+    records, warnings = PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
 
     assert records[spans[0].start].identifier == records[spans[1].start].identifier
-    assert records[spans[2].start].identifier != records[spans[0].start].identifier
+    assert warnings == []
+    assert len(generator.link_calls) == 1
+
+
+def test_all_person_mentions_are_uncapped_beyond_previous_64_candidate_limit():
+    values = [f"Person{i} Surname{i}" for i in range(66)]
+    text = "; ".join(values)
+    spans = person_spans(text, *values)
+    generator = ScriptedGenerator(link="same")
+
+    records, warnings = PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
+
+    assert len(generator.link_calls) == 66 * 65 // 2
+    assert len(records) == 66
+    assert len({record.identifier for record in records.values()}) == 1
+    assert warnings == []
+
+
+@pytest.mark.parametrize("barrier", ["different", "unknown"])
+@pytest.mark.parametrize("reverse_spans", [False, True])
+def test_conflicting_same_component_is_order_independent(barrier, reverse_spans):
+    text = "Irene Jones; Robert Smith; I. Jones"
+    spans = person_spans(text, "Irene Jones", "Robert Smith", "I. Jones")
+    if reverse_spans:
+        spans = list(reversed(spans))
+    barrier_pair = frozenset(("Irene Jones", "Robert Smith"))
+
+    def relation(payload):
+        pair = frozenset((payload["left"]["mention"], payload["right"]["mention"]))
+        return barrier if pair == barrier_pair else "same"
+
+    generator = ScriptedGenerator(link=relation)
+    records, warnings = PersonPipeline(generator, morph=FakeMorph()).link(text, spans)
+
+    by_value = {span.value: records[span.start].identifier for span in spans}
+    assert by_value["Irene Jones"] != by_value["Robert Smith"]
+    assert len(generator.link_calls) == 3
     assert warnings
 
 
@@ -457,9 +518,21 @@ def test_adjacent_identical_markers_have_distinct_target_contexts():
     assert generator.form_calls[0]["target_start"] != generator.form_calls[1]["target_start"]
 
 
-def test_declined_patronymic_order_and_full_alias_preference():
+def test_patronymic_variants_are_all_offered_and_canonical_name_is_preserved():
     pytest.importorskip("pymorphy3")
-    pipeline = PersonPipeline(ScriptedGenerator())
-    assert pipeline._candidate("Ивана Петрова Ивановича", "Иван Иванович Петров")
-    assert not pipeline._candidate("Ивана Петрова Ивановича", "Иван Петрович Петров")
+    text = "Ивана Петрова Ивановича; Иван Иванович Петров; Иван Петрович Петров"
+    values = ["Ивана Петрова Ивановича", "Иван Иванович Петров", "Иван Петрович Петров"]
+    generator = ScriptedGenerator(link="unknown")
+    pipeline = PersonPipeline(generator)
+    pipeline.link(text, person_spans(text, *values))
+
+    assert len(generator.link_calls) == 3
+    assert {
+        frozenset((payload["left"]["mention"], payload["right"]["mention"]))
+        for payload in generator.link_calls
+    } == {
+        frozenset((values[0], values[1])),
+        frozenset((values[0], values[2])),
+        frozenset((values[1], values[2])),
+    }
     assert pipeline._canonical(["И. И. Петров", "Иван Петров"]) == "Иван Петров"

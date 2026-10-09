@@ -92,18 +92,6 @@ class PersonPipeline:
             return value[:1].upper() + value[1:]
         return value
 
-    def _lemmas(self, token: str) -> set[str]:
-        morph = self._get_morph()
-        if morph is None or not _CYRILLIC.search(token):
-            return {token.casefold()}
-        try:
-            parses = morph.parse(token)
-            if parses:
-                return {str(parse.normal_form).casefold() for parse in parses}
-        except (AttributeError, TypeError, ValueError):
-            pass
-        return {token.casefold()}
-
     def _patronymic(self, token: str) -> bool:
         value = token.casefold()
         suffixes = ("ович", "евич", "ич", "овна", "евна", "ична", "инична")
@@ -174,187 +162,23 @@ class PersonPipeline:
         except (AttributeError, TypeError, ValueError):
             return set()
 
-    def _parts(self, value: str) -> tuple[set[str], set[str] | None, set[str] | None, bool]:
-        """Return given-name forms, surname forms, patronymic forms, initial flag."""
-        tokens = _tokens(value)
-        if not tokens:
-            return set(), None, None, False
-        initial = _is_initial(tokens[0])
-        given = {tokens[0][0].casefold()} if initial else self._lemmas(tokens[0])
-        if len(tokens) == 1:
-            # Surname-only mentions are candidates but never sufficient by
-            # themselves to establish identity.
-            return given, self._lemmas(tokens[0]), None, initial
-        surname_index = len(tokens) - 1
-        patronymic_index: int | None = None
-        if len(tokens) >= 3:
-            if self._patronymic(tokens[1]):
-                patronymic_index = 1
-            elif self._patronymic(tokens[-1]):
-                patronymic_index = len(tokens) - 1
-                surname_index = 1
-            else:
-                # Russian full-name order is normally given, patronymic,
-                # surname; this fallback handles names without recognizable
-                # patronymic endings conservatively.
-                patronymic_index = 1
-        surname = self._lemmas(tokens[surname_index])
-        patronymic = self._lemmas(tokens[patronymic_index]) if patronymic_index is not None else None
-        return given, surname, patronymic, initial
-
-    def _candidate(self, left: str, right: str) -> bool:
-        given_a, surname_a, patronymic_a, initial_a = self._parts(left)
-        given_b, surname_b, patronymic_b, initial_b = self._parts(right)
-        if not given_a or not given_b or not surname_a or not surname_b:
-            return False
-        if surname_a.isdisjoint(surname_b):
-            return False
-        raw_a, raw_b = _tokens(left), _tokens(right)
-        short_a, short_b = len(raw_a) == 1, len(raw_b) == 1
-        if not short_a and not short_b and not initial_a and not initial_b and given_a.isdisjoint(given_b):
-            return False
-        if (patronymic_a and patronymic_b and patronymic_a.isdisjoint(patronymic_b)):
-            return False
-        # A one-token surname is compared to the family-name component. A
-        # one-letter initial must match the first letter of the explicit name.
-        for raw, initial, expanded, other_short in (
-                (left, initial_a, given_b, short_b), (right, initial_b, given_a, short_a)):
-            first = _tokens(raw)[0]
-            if initial and not other_short and not all(
-                    value.startswith(first[0].casefold()) for value in expanded):
-                return False
-        return True
-
-    def _compatible_cluster_names(self, left: str, right: str) -> bool:
-        given_a, surname_a, patronymic_a, initial_a = self._parts(left)
-        given_b, surname_b, patronymic_b, initial_b = self._parts(right)
-        if not surname_a or not surname_b or surname_a.isdisjoint(surname_b):
-            return False
-        raw_a, raw_b = _tokens(left), _tokens(right)
-        short_a, short_b = len(raw_a) == 1, len(raw_b) == 1
-        if not short_a and not short_b and not initial_a and not initial_b and given_a.isdisjoint(given_b):
-            return False
-        if patronymic_a and patronymic_b and patronymic_a.isdisjoint(patronymic_b):
-            return False
-        return True
-
-    def _candidate_pairs(self, mentions: list[Any], limit: int = 64) -> tuple[set[tuple[int, int]], set[int]]:
-        """Build a bounded surname/initial index instead of comparing all pairs."""
-        buckets: dict[tuple[str, str], list[int]] = {}
-        surname_buckets: dict[str, list[int]] = {}
-        part_cache: list[tuple[set[str], set[str] | None, set[str] | None, bool]] = []
-        surname_only: list[bool] = []
-        for index, mention in enumerate(mentions):
-            parts = self._parts(mention.value)
-            part_cache.append(parts)
-            tokens = _tokens(mention.value)
-            only_surname = len(tokens) == 1
-            surname_only.append(only_surname)
-            given, surnames, _, initial = parts
-            if not surnames:
-                continue
-            initials = ({tokens[0][0].casefold()} if initial else
-                        {value[0] for value in given if value})
-            for surname in surnames:
-                surname_buckets.setdefault(surname, []).append(index)
-                for first in initials:
-                    bucket = buckets.setdefault((surname, first), [])
-                    if not bucket or bucket[-1] != index:
-                        bucket.append(index)
-
-        pairs: set[tuple[int, int]] = set()
-        overflow: set[int] = set()
-        for index, mention in enumerate(mentions):
-            given, surnames, _, initial = part_cache[index]
-            if not surnames:
-                continue
-            tokens = _tokens(mention.value)
-            only_surname = surname_only[index]
-            initials = ({tokens[0][0].casefold()} if initial else
-                        {value[0] for value in given if value})
-            candidates: set[int] = set()
-            capped = False
-
-            def add_limited(values: list[int]) -> None:
-                nonlocal capped
-                for value in values:
-                    candidates.add(value)
-                    if len(candidates) > limit:
-                        capped = True
-                        return
-
-            for surname in surnames:
-                if only_surname:
-                    add_limited(surname_buckets.get(surname, []))
-                else:
-                    for first in initials:
-                        add_limited(buckets.get((surname, first), []))
-                        if capped:
-                            break
-                    # Single-letter mentions look up every given-name initial
-                    # sharing their surname; their ambiguity is assessed below.
-                    if initial and not capped:
-                        add_limited(surname_buckets.get(surname, []))
-                if capped:
-                    break
-            candidates.discard(index)
-            accepted: list[int] = []
-            for other in sorted(candidates, key=lambda value: (abs(value - index), value)):
-                if self._candidate(mention.value, mentions[other].value):
-                    accepted.append(other)
-            if capped or len(accepted) > limit:
-                overflow.add(index)
-                accepted = accepted[:limit]
-            for other in accepted:
-                pairs.add((min(index, other), max(index, other)))
-        return pairs, overflow
-
     def link(self, text: str, spans: list[Any]) -> tuple[dict[int, PersonRecord], list[str]]:
         mentions = [span for span in spans if getattr(span, "code", None) == "PERSON"]
         if not mentions:
             return {}, []
 
-        # Union-find over mentions; only blocked candidates are sent to the model.
-        parent = list(range(len(mentions)))
-
-        def root(index: int) -> int:
-            while parent[index] != index:
-                parent[index] = parent[parent[index]]
-                index = parent[index]
-            return index
-
-        def union(a: int, b: int) -> bool:
-            ra, rb = root(a), root(b)
-            if ra != rb:
-                members_a = [index for index in range(len(mentions)) if root(index) == ra]
-                members_b = [index for index in range(len(mentions)) if root(index) == rb]
-                for index_a in members_a:
-                    for index_b in members_b:
-                        if not self._compatible_cluster_names(
-                                mentions[index_a].value, mentions[index_b].value):
-                            return False
-                parent[rb] = ra
-            return True
-
         warnings: list[str] = []
-        candidate_pairs, overflow = self._candidate_pairs(mentions)
+        candidate_pairs = list(itertools.combinations(range(len(mentions)), 2))
         event("person.candidates", {
             "mentions": [{"value": mention.value, "start": mention.start,
                           "end": mention.end} for mention in mentions],
             "candidate_pairs": [
                 {"left": mentions[i].value, "left_start": mentions[i].start,
                  "right": mentions[j].value, "right_start": mentions[j].start}
-                for i, j in sorted(candidate_pairs)
+                for i, j in candidate_pairs
             ],
-            "overflow_indices": sorted(overflow),
+            "candidate_count": len(candidate_pairs),
         })
-        if overflow:
-            warnings.append("Some person mentions had too many candidates and were kept separate.")
-        cannot_link: set[tuple[int, int]] = set()
-
-        def full_name(index: int) -> bool:
-            tokens = _tokens(mentions[index].value)
-            return len(tokens) >= 2 and not _is_initial(tokens[0])
 
         def decide(i: int, j: int) -> str:
             left, right = mentions[i], mentions[j]
@@ -396,128 +220,60 @@ class PersonPipeline:
             })
             return decision
 
-        def merge_same_pairs(same_pairs: list[tuple[int, int]]) -> None:
-            for i, j in same_pairs:
-                left_root, right_root = root(i), root(j)
-                if left_root == right_root:
-                    continue
-                blocked = any((min(a, b), max(a, b)) in cannot_link
-                              for a in range(len(mentions)) if root(a) == left_root
-                              for b in range(len(mentions)) if root(b) == right_root)
-                if blocked:
-                    event("person.link_conflict", {
-                        "left": mentions[i].value, "right": mentions[j].value,
-                        "reason": "contradicts_prior_different_or_unknown_decision",
-                    })
-                    warnings.append("Conflicting person identities were kept separate.")
-                elif not union(i, j):
-                    event("person.link_conflict", {
-                        "left": mentions[i].value, "right": mentions[j].value,
-                        "reason": "incompatible_name_components",
-                    })
-                    warnings.append("Conflicting person-name details were kept separate.")
-
-        def store_decision(i: int, j: int, relation: str,
-                           same_pairs: list[tuple[int, int]]) -> None:
-            pair = (min(i, j), max(i, j))
-            if relation == "same":
-                same_pairs.append(pair)
-            else:
-                # Both explicit-different and uncertain pairs constrain later
-                # transitive merges; an unknown decision must not become a link
-                # through a third mention.
-                cannot_link.add(pair)
+        # Ask the model about the complete graph before considering any merge.
+        # This prevents a later different/unknown decision from being hidden by
+        # a cluster formed from earlier same decisions.
+        relations: dict[tuple[int, int], str] = {}
+        for i, j in candidate_pairs:
+            relation = decide(i, j)
+            relations[(i, j)] = relation
             if relation == "invalid":
                 warnings.append("Person mentions could not be linked with confidence.")
             elif relation == "unknown":
                 warnings.append("A person-name mention was ambiguous and kept separate.")
 
-        # Establish complete-name clusters before considering initials and
-        # surname-only mentions, so a short form cannot attach to Ivan first and
-        # then bridge Ivan to Igor through a shared initial.
-        ordered_pairs = sorted(candidate_pairs)
-        full_same: list[tuple[int, int]] = []
-        for i, j in ordered_pairs:
-            if full_name(i) and full_name(j) and i not in overflow and j not in overflow:
-                store_decision(i, j, decide(i, j), full_same)
-            elif full_name(i) and full_name(j):
-                event("person.link_decision", {
-                    "left": {"mention": mentions[i].value, "start": mentions[i].start},
-                    "right": {"mention": mentions[j].value, "start": mentions[j].start},
-                    "decision": "kept_separate", "reason": "candidate_overflow",
-                })
-        merge_same_pairs(full_same)
+        # Build clusters only from model-same edges. Explicit different,
+        # unknown, and invalid relations block a merge across their endpoints.
+        parent = list(range(len(mentions)))
 
-        anchored_roots: dict[int, set[int]] = {}
-        quarantined: set[int] = set(overflow)
+        def root(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        cannot_link = {pair for pair, relation in relations.items() if relation != "same"}
+        same_pairs = [pair for pair in candidate_pairs if relations[pair] == "same"]
+        for i, j in same_pairs:
+            left_root, right_root = root(i), root(j)
+            if left_root == right_root:
+                continue
+            barrier = next((
+                (a, b)
+                for a in range(len(mentions)) if root(a) == left_root
+                for b in range(len(mentions)) if root(b) == right_root
+                if (min(a, b), max(a, b)) in cannot_link
+            ), None)
+            if barrier is not None:
+                a, b = barrier
+                event("person.link_conflict", {
+                    "left": {"mention": mentions[a].value, "start": mentions[a].start},
+                    "right": {"mention": mentions[b].value, "start": mentions[b].start},
+                    "relation": relations[(min(a, b), max(a, b))],
+                    "reason": "contradictory_model_relations",
+                })
+                warnings.append("Conflicting model identity decisions were kept separate.")
+                continue
+            parent[right_root] = left_root
+
+        grouped_mentions: dict[int, list[int]] = {}
         for index in range(len(mentions)):
-            if full_name(index):
-                continue
-            anchors = {
-                root(other) for other in range(len(mentions))
-                if full_name(other) and other not in overflow and
-                (min(index, other), max(index, other)) in candidate_pairs
-            }
-            anchored_roots[index] = anchors
-            if len(anchors) > 1 or index in overflow:
-                quarantined.add(index)
-                event("person.link_decision", {
-                    "mention": mentions[index].value,
-                    "start": mentions[index].start,
-                    "decision": "kept_separate",
-                    "reason": "ambiguous_abbreviation" if len(anchors) > 1 else "candidate_overflow",
-                    "anchor_mentions": [
-                        {"value": mentions[other].value, "start": mentions[other].start}
-                        for other in range(len(mentions)) if root(other) in anchors
-                    ],
-                })
-                warnings.append("An ambiguous abbreviated person-name mention matched multiple people and was kept separate.")
-
-        short_same: list[tuple[int, int]] = []
-        for i, j in ordered_pairs:
-            if full_name(i) and full_name(j):
-                continue
-            if i in quarantined or j in quarantined:
-                event("person.link_decision", {
-                    "left": {"mention": mentions[i].value, "start": mentions[i].start},
-                    "right": {"mention": mentions[j].value, "start": mentions[j].start},
-                    "decision": "kept_separate", "reason": "ambiguous_abbreviation",
-                })
-                continue
-            roots_i, roots_j = anchored_roots.get(i, set()), anchored_roots.get(j, set())
-            if full_name(i) and roots_j and root(i) not in roots_j:
-                event("person.link_decision", {
-                    "left": {"mention": mentions[i].value, "start": mentions[i].start},
-                    "right": {"mention": mentions[j].value, "start": mentions[j].start},
-                    "decision": "kept_separate", "reason": "not_linked_to_candidate_anchor",
-                })
-                continue
-            if full_name(j) and roots_i and root(j) not in roots_i:
-                event("person.link_decision", {
-                    "left": {"mention": mentions[i].value, "start": mentions[i].start},
-                    "right": {"mention": mentions[j].value, "start": mentions[j].start},
-                    "decision": "kept_separate", "reason": "not_linked_to_candidate_anchor",
-                })
-                continue
-            # Two abbreviated mentions tied to different complete identities
-            # cannot act as a bridge between those identities.
-            if roots_i and roots_j and roots_i.isdisjoint(roots_j):
-                event("person.link_decision", {
-                    "left": {"mention": mentions[i].value, "start": mentions[i].start},
-                    "right": {"mention": mentions[j].value, "start": mentions[j].start},
-                    "decision": "kept_separate", "reason": "different_candidate_anchors",
-                })
-                continue
-            store_decision(i, j, decide(i, j), short_same)
-        merge_same_pairs(short_same)
-
-        groups: dict[int, list[int]] = {}
-        for index in range(len(mentions)):
-            groups.setdefault(root(index), []).append(index)
+            grouped_mentions.setdefault(root(index), []).append(index)
+        groups = list(grouped_mentions.values())
 
         records_by_start: dict[int, PersonRecord] = {}
         logged_groups: list[dict[str, Any]] = []
-        for members in groups.values():
+        for members in groups:
             observed = [mentions[index].value for index in members]
             canonical = self._canonical(observed)
             record = PersonRecord(

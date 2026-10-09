@@ -29,6 +29,12 @@ _TOKEN = re.compile(r"[^\W_]+(?:['’\-][^\W_]+)*\.?", re.UNICODE)
 _INITIAL = re.compile(r"^[A-Za-zА-Яа-яЁё]$")
 _CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 _LATIN = re.compile(r"[A-Za-z]")
+_ADDRESS_MARKER_LINE = re.compile(r"^\s*[⟦\[]ADDRESS_[^⟧\]]+[⟧\]]\s*$")
+_GERMAN_STREET_LINE = re.compile(
+    r"^[A-ZÄÖÜ][\wÄÖÜäöüß.'’\-]*(?:\s+[\wÄÖÜäöüß.'’\-]+){0,4}"
+    r"\s+\d+[a-zA-Z]?(?:\s*[-/]\s*\d+[a-zA-Z]?)?$"
+)
+_GERMAN_POSTAL_CITY_LINE = re.compile(r"^\s*\d{5}\s+[^\W\d_][^\r\n]*$", re.UNICODE)
 _CASE_OPTIONS = ("nomn", "gent", "datv", "accs", "ablt", "loct")
 _SYSTEM_LINK = (
     "You link observed person-name mentions in a document. Return one JSON object "
@@ -501,9 +507,47 @@ class PersonPipeline:
     def restore(self, text: str, marker: str, record: PersonRecord,
                 start: int, end: int) -> str | None:
         """Return a selected finite form for one marker occurrence, or None."""
+        return self.restore_with_details(text, marker, record, start, end)[0]
+
+    @staticmethod
+    def _is_german_recipient_address(text: str, marker: str,
+                                     start: int, end: int) -> bool:
+        """Recognize a name in a compact German recipient-address block."""
+        line_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", end)
+        if line_end < 0:
+            line_end = len(text)
+        target_line = text[line_start:line_end].strip(" \t\r")
+        if target_line != marker:
+            return False
+
+        prior_lines = text[:line_start].splitlines()
+        if not prior_lines or not re.fullmatch(r"An\s*:?(?:\s+(?:den|die|das|dem|der))?", prior_lines[-1].strip(), re.IGNORECASE):
+            return False
+
+        following = [line for line in text[line_end + 1:line_end + 801].splitlines()
+                     if line.strip()]
+        # The recipient's address may itself be pseudonymized or remain visible.
+        if len(following) < 2 or not (
+                _ADDRESS_MARKER_LINE.fullmatch(following[0])
+                or _GERMAN_STREET_LINE.fullmatch(following[0].strip())):
+            return False
+        return bool(_GERMAN_POSTAL_CITY_LINE.fullmatch(following[1]))
+
+    def restore_with_details(self, text: str, marker: str, record: PersonRecord,
+                             start: int, end: int) -> tuple[str | None, str]:
+        """Restore one occurrence and explain the conservative decision."""
+        canonical = record.canonical
+        # In German correspondence the recipient line is conventionally the
+        # uninflected nominative. Restrict this shortcut to a clear address
+        # block and a Latin canonical name.
+        if (_LATIN.search(canonical) and not _CYRILLIC.search(canonical)
+                and self._is_german_recipient_address(text, marker, start, end)):
+            return canonical, "recipient_address"
+
         options = self._forms(record.canonical)
         if not options:
-            return None
+            return None, "no_forms"
         window_start = max(0, start - 180)
         window_end = min(len(text), end + 180)
         payload = {
@@ -519,9 +563,15 @@ class PersonPipeline:
         try:
             result = self.generator.choose(_SYSTEM_FORM, payload)
         except Exception:
-            return None
-        form = result.get("form") if isinstance(result, dict) else None
-        return form if isinstance(form, str) and form in options else None
+            return None, "local_model_error"
+        if not isinstance(result, dict) or "form" not in result:
+            return None, "invalid_model_choice"
+        form = result["form"]
+        if form is None:
+            return None, "model_uncertain"
+        if not isinstance(form, str) or form not in options:
+            return None, "invalid_model_choice"
+        return form, "model_selected"
 
     def _forms(self, canonical: str) -> list[str]:
         tokens = _tokens(canonical)

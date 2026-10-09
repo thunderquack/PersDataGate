@@ -52,6 +52,12 @@ def mocked_transformers(monkeypatch, *, response: str, input_tokens: int = 8):
             calls["encoded"].append((rendered, kwargs))
             return {"input_ids": input_ids, "attention_mask": FakeTensor(input_tokens)}
 
+        def encode(self, text, **kwargs):
+            assert kwargs == {"add_special_tokens": False}
+            return [ord(char) + 100 for char in text]
+
+        eos_token_id = 2
+
         def decode(self, tokens, **kwargs):
             return response
 
@@ -153,3 +159,49 @@ def test_returns_json_values_for_caller_semantic_validation(monkeypatch, tmp_pat
     assert generator.choose("Choose an offered person", {"allowed_ids": ["p1"]}) == {
         "person_id": "not-an-offered-id"
     }
+
+
+@pytest.mark.parametrize(
+    ("payload", "permitted"),
+    [
+        ({"allowed_relations": ["same", "different"]}, ['{"relation":"same"}', '{"relation":"different"}']),
+        ({"allowed_forms": ["Ивана Иванова", "Ivanov" ]}, ['{"form":"Ивана Иванова"}', '{"form":"Ivanov"}', '{"form":null}']),
+    ],
+)
+def test_constrains_generation_to_exact_unicode_choices(monkeypatch, tmp_path, payload, permitted):
+    calls = mocked_transformers(monkeypatch, response=permitted[0])
+    generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
+
+    generator.choose("Choose an allowed value", payload)
+    generation = calls["generate"][0]
+    callback = generation["prefix_allowed_tokens_fn"]
+    prompt = [0] * 8
+    sequences = [[ord(char) + 100 for char in text] for text in permitted]
+    first_allowed = callback(0, prompt)
+    assert first_allowed == sorted({sequence[0] for sequence in sequences})
+
+    for tokens in sequences:
+        for offset in range(len(tokens)):
+            allowed = callback(0, prompt + tokens[:offset])
+            assert tokens[offset] in allowed
+        terminal = callback(0, prompt + tokens)
+        assert terminal == [2]
+
+    # An out-of-trie token cannot lead to another name or relation.
+    assert callback(0, prompt + [999]) == [2]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"allowed_relations": []},
+        {"allowed_forms": ["valid", 3]},
+    ],
+)
+def test_rejects_invalid_finite_choice_lists(monkeypatch, tmp_path, payload):
+    calls = mocked_transformers(monkeypatch, response='{"relation":"same"}')
+    generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
+
+    with pytest.raises(GenerationError):
+        generator.choose("Choose", payload)
+    assert calls["generate"] == []

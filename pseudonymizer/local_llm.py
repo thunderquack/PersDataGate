@@ -22,6 +22,59 @@ class GenerationError(RuntimeError):
     """Safe, bounded error from model input validation or generation."""
 
 
+def _finite_choices(payload: Any) -> list[dict[str, Any]] | None:
+    """Return the only permitted JSON outputs for production choice payloads."""
+    if not isinstance(payload, dict):
+        return None
+    key = "allowed_relations" if "allowed_relations" in payload else (
+        "allowed_forms" if "allowed_forms" in payload else None
+    )
+    if key is None:
+        return None
+    values = payload[key]
+    if not isinstance(values, list) or not values or any(not isinstance(v, str) for v in values):
+        raise GenerationError(f"{key} must be a non-empty list of strings")
+    output_key = "relation" if key == "allowed_relations" else "form"
+    choices = [{output_key: value} for value in dict.fromkeys(values)]
+    if key == "allowed_forms":
+        choices.append({"form": None})
+    return choices
+
+
+def _choice_trie(tokenizer: Any, choices: list[dict[str, Any]]) -> dict[int, Any]:
+    """Build a token trie containing only serialized candidate objects."""
+    trie: dict[int, Any] = {}
+    for choice in choices:
+        text = json.dumps(choice, ensure_ascii=False, separators=(",", ":"))
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        if not tokens or len(tokens) + 1 > MAX_NEW_TOKENS:
+            raise GenerationError("A permitted model choice exceeds the output token limit")
+        node = trie
+        for token in tokens:
+            node = node.setdefault(int(token), {})
+        node[None] = True
+    return trie
+
+
+def _allowed_next_tokens(trie: dict[int, Any], input_length: int, eos_token_id: int):
+    """Create Transformers' callback for constrained, deterministic decoding."""
+    def callback(_batch_id: int, sequence: Any) -> list[int]:
+        if hasattr(sequence, "tolist"):
+            sequence = sequence.tolist()
+        if sequence and isinstance(sequence[0], list):
+            sequence = sequence[0]
+        node: Any = trie
+        for token in sequence[input_length:]:
+            node = node.get(int(token)) if isinstance(node, dict) else None
+            if node is None:
+                return [eos_token_id]
+        allowed = [token for token in node if token is not None]
+        if node.get(None):
+            allowed.append(eos_token_id)
+        return allowed or [eos_token_id]
+    return callback
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -103,11 +156,22 @@ class QwenGenerator:
 
         model_inputs = {key: value.to(self.device) for key, value in encoded.items()}
         try:
+            choices = _finite_choices(payload)
+            generation_options: dict[str, Any] = {}
+            if choices is not None:
+                eos_token_id = self.tokenizer.eos_token_id
+                if eos_token_id is None:
+                    raise GenerationError("Tokenizer has no EOS token for constrained output")
+                trie = _choice_trie(self.tokenizer, choices)
+                generation_options["prefix_allowed_tokens_fn"] = _allowed_next_tokens(
+                    trie, input_tokens, int(eos_token_id)
+                )
             with _GENERATION_LOCK, self._torch.inference_mode():
                 output = self.model.generate(
                     **model_inputs,
                     max_new_tokens=MAX_NEW_TOKENS,
                     do_sample=False,
+                    **generation_options,
                 )
             completion_ids = output[0, input_ids.shape[-1] :]
             completion = self.tokenizer.decode(completion_ids, skip_special_tokens=True).strip()

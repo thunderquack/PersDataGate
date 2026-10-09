@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import pytest
 
-from pseudonymizer.persons import PersonPipeline
+from pseudonymizer.persons import PersonPipeline, PersonRecord
 from pseudonymizer.service import PseudonymMapping, Span, restore_text
 
 
@@ -250,6 +251,111 @@ def test_german_person_form_allows_only_canonical_or_finite_possessive():
     marker = "⟦PERSON_x_1⟧"
 
     assert pipeline.restore(marker, marker, record, 0, len(marker)) == "Max Müllers"
+
+
+@pytest.mark.parametrize(
+    ("address", "canonical"),
+    [
+        ("An\n⟦PERSON_x_1⟧\n⟦ADDRESS_x_1⟧\n12051 Berlin", "Egor Ivanov"),
+        ("An\n⟦PERSON_x_1⟧\nHermannstr. 176\n12051 Berlin", "Egor Ivanov"),
+        ("AN:\n⟦PERSON_x_1⟧\nRobert-Siewert-Str. 24\n10318 Berlin", "EGOR IVANOV"),
+    ],
+)
+def test_german_recipient_address_restores_latin_canonical_without_model(
+        address, canonical):
+    marker = "⟦PERSON_x_1⟧"
+    generator = ScriptedGenerator(form="wrong model form")
+    pipeline = PersonPipeline(generator)
+    record = PersonPipeline(ScriptedGenerator()).link(
+        canonical, person_spans(canonical, canonical)
+    )[0][0]
+    start = address.index(marker)
+
+    value, reason = pipeline.restore_with_details(
+        address, marker, record, start, start + len(marker)
+    )
+
+    assert (value, reason) == (canonical, "recipient_address")
+    assert generator.form_calls == []
+    assert pipeline.restore(address, marker, record, start, start + len(marker)) == canonical
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "An\n⟦PERSON_x_1⟧\nHermannstr. 176",  # no postal line
+        "An ⟦PERSON_x_1⟧\nHermannstr. 176\n12051 Berlin",  # inline recipient
+        "An\n⟦PERSON_x_1⟧\nМосква, ул. Ленина, 10\n101000 Москва",
+    ],
+)
+def test_recipient_address_shortcut_rejects_ambiguous_or_non_german_context(text):
+    marker = "⟦PERSON_x_1⟧"
+    generator = ScriptedGenerator(form=None)
+    pipeline = PersonPipeline(generator, morph=FakeMorph() if "Москва" in text else None)
+    canonical = "Egor Ivanov" if "Москва" not in text else "Иван Петров"
+    record = PersonPipeline(ScriptedGenerator()).link(
+        canonical, person_spans(canonical, canonical)
+    )[0][0]
+    start = text.index(marker)
+
+    value, reason = pipeline.restore_with_details(
+        text, marker, record, start, start + len(marker)
+    )
+
+    assert value is None
+    assert reason == "model_uncertain"
+    assert generator.form_calls
+
+
+def test_restore_diagnostics_distinguish_model_choices_failures_and_missing_forms():
+    canonical = "Max Müller"
+    marker = "⟦PERSON_x_1⟧"
+    record = PersonPipeline(ScriptedGenerator()).link(
+        canonical, person_spans(canonical, canonical)
+    )[0][0]
+    context = f"Sehr geehrte {marker}"
+    start = context.index(marker)
+
+    assert PersonPipeline(ScriptedGenerator(form="Max Müller")).restore_with_details(
+        context, marker, record, start, start + len(marker)
+    ) == ("Max Müller", "model_selected")
+    assert PersonPipeline(ScriptedGenerator(form=None)).restore_with_details(
+        context, marker, record, start, start + len(marker)
+    ) == (None, "model_uncertain")
+    assert PersonPipeline(ScriptedGenerator(form="Other Name")).restore_with_details(
+        context, marker, record, start, start + len(marker)
+    ) == (None, "invalid_model_choice")
+
+    class BrokenGenerator:
+        def choose(self, system, payload):
+            raise RuntimeError("local model unavailable")
+
+    assert PersonPipeline(BrokenGenerator()).restore_with_details(
+        context, marker, record, start, start + len(marker)
+    ) == (None, "local_model_error")
+    no_forms_pipeline = PersonPipeline(ScriptedGenerator())
+    no_forms_pipeline._forms = lambda canonical: []
+    assert no_forms_pipeline.restore_with_details(
+        context, marker, PersonRecord("x", "Иван", ("Иван",)), start,
+        start + len(marker)
+    ) == (None, "no_forms")
+
+
+def test_repeated_occurrences_use_recipient_shortcut_only_for_matching_address_block():
+    marker = "⟦PERSON_x_1⟧"
+    text = (f"An\n{marker}\nHermannstr. 176\n12051 Berlin\n\n"
+            f"Sehr geehrte {marker}")
+    record = PersonRecord("x", "Egor Ivanov", ("Egor Ivanov",))
+    generator = ScriptedGenerator(form="Egor Ivanov")
+    pipeline = PersonPipeline(generator)
+    starts = [match.start() for match in re.finditer(re.escape(marker), text)]
+
+    first = pipeline.restore_with_details(text, marker, record, starts[0], starts[0] + len(marker))
+    second = pipeline.restore_with_details(text, marker, record, starts[1], starts[1] + len(marker))
+
+    assert first == ("Egor Ivanov", "recipient_address")
+    assert second == ("Egor Ivanov", "model_selected")
+    assert len(generator.form_calls) == 1
 
 
 def test_repeated_person_marker_is_inflected_separately_for_each_occurrence():

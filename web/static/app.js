@@ -47,6 +47,14 @@ function showSteps(result) {
   const steps = result.steps || {};
   const sources = {gliner: "GLiNER", rule: "Правило"};
   const statuses = {restored: "Восстановлено", uncertain: "Неуверенно — маркер сохранён", unknown: "Неизвестный маркер"};
+  const reasons = {
+    recipient_address: "Поле имени в немецком адресном блоке",
+    model_selected: "Форма выбрана Qwen",
+    model_uncertain: "Qwen выбрала null",
+    invalid_model_choice: "Недопустимый выбор Qwen",
+    local_model_error: "Ошибка локальной модели",
+    no_forms: "Нет допустимых словоформ",
+  };
   showRows("entities", steps.entities?.map((row) => ({...row, source: sources[row.source] || row.source})), [
     ["value", "Найденный текст"], ["code", "Тип"], ["source", "Источник"], ["start", "Начало"], ["end", "Конец"],
   ], "Персональные данные не найдены.", "Сервер не передал сведения о распознанных данных.");
@@ -56,8 +64,9 @@ function showSteps(result) {
   if (typeof steps.anonymized_text === "string") setText("prepared", steps.anonymized_text, !steps.anonymized_text);
   else if (typeof result.prepared_text === "string") setText("prepared", result.prepared_text, !result.prepared_text);
   else setText("prepared", "Сервер не передал псевдонимизированный текст.", true);
-  showRows("restorations", steps.restorations?.map((row) => ({...row, status: statuses[row.status] || row.status})), [
-    ["marker", "Маркер"], ["value", "Подставленное значение"], ["status", "Результат"], ["start", "Начало"], ["end", "Конец"],
+  showRows("restorations", steps.restorations?.map((row) => ({...row,
+    status: statuses[row.status] || row.status, reason: reasons[row.reason] || row.reason})), [
+    ["marker", "Маркер"], ["value", "Подставленное значение"], ["status", "Результат"], ["reason", "Причина"], ["start", "Начало"], ["end", "Конец"],
   ], "В ответе нет маркеров для восстановления.", "Сервер не передал сведения о восстановленных именах и словоформах.");
 }
 

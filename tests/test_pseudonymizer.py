@@ -236,3 +236,24 @@ def test_opt_in_steps_capture_entities_clusters_and_occurrence_forms():
         repeated = client.post("/deanonymize", json={"mapping_id": traced["mapping_id"], "text": marker}).json()
         assert "steps" not in repeated
         assert repeated["text"] == "Ивану Петрову"
+
+
+def test_address_restoration_trace_reports_reason_without_calling_qwen():
+    from pseudonymizer.persons import PersonPipeline, PersonRecord
+    from pseudonymizer.service import PseudonymMapping
+
+    class ForbiddenGenerator:
+        def choose(self, *args):
+            raise AssertionError("Address field needs no model selection")
+
+    marker = "⟦PERSON_local_1⟧"
+    mapping = PseudonymMapping()
+    mapping[marker] = "Egor Ivanov"
+    mapping.persons[marker] = PersonRecord("one", "Egor Ivanov", ("Egor Ivanov", "EGOR IVANOV"))
+    text = f"An\n{marker}\n⟦ADDRESS_local_1⟧\n12051 Berlin"
+    trace = {}
+    restored, warnings = restore_text(text, mapping, PersonPipeline(ForbiddenGenerator()), steps=trace)
+    assert restored.startswith("An\nEgor Ivanov\n")
+    assert trace["restorations"][0]["reason"] == "recipient_address"
+    assert trace["restorations"][0]["status"] == "restored"
+    assert all("inflect" not in warning for warning in warnings)

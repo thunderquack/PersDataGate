@@ -366,20 +366,28 @@ def restore_text(text: str, mapping: dict[str, str], pipeline: Any | None = None
                 "value": value, "status": "restored",
             })
             return value
+        reason = "model_selected"
         try:
-            value = pipeline.restore(text, marker, record, match.start(), match.end())
+            detailed = getattr(pipeline, "restore_with_details", None)
+            if detailed is not None:
+                value, reason = detailed(text, marker, record, match.start(), match.end())
+            else:
+                value = pipeline.restore(text, marker, record, match.start(), match.end())
+                if value is None:
+                    reason = "model_uncertain"
         except Exception:
             value = None
+            reason = "local_model_error"
         if value is None:
             warnings.append("Could not safely inflect a person name; marker left unchanged.")
             occurrences.append({
                 "marker": marker, "start": match.start(), "end": match.end(),
-                "value": None, "status": "uncertain",
+                "value": None, "status": "uncertain", "reason": reason,
             })
             return marker
         occurrences.append({
             "marker": marker, "start": match.start(), "end": match.end(),
-            "value": value, "status": "restored",
+            "value": value, "status": "restored", "reason": reason,
         })
         return value
 

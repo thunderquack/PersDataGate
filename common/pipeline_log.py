@@ -234,6 +234,8 @@ def install_pipeline_logging(app: FastAPI, service: str) -> None:
 
             try:
                 response = await call_next(request)
+            except PipelineLogError:
+                return _pipeline_error(pipeline_id, status_code=503, code="pipeline_log_failed")
             except Exception as exc:
                 try:
                     event("error", {"type": type(exc).__name__})

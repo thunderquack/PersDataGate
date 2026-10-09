@@ -170,7 +170,8 @@ def test_person_pipeline_failures_and_incomplete_assignments_fail_closed():
         with TestClient(create_app(detector=detector, pipeline=pipeline)) as client:
             response = client.post("/anonymize", json={"text": source})
         assert response.status_code == 503
-        assert response.json() == {"detail": "anonymization_failed"}
+        assert response.json()["detail"] == "anonymization_failed"
+        assert response.json()["pipeline_id"] == response.headers["X-Pipeline-ID"]
 
 
 def test_rich_person_mapping_api_restoration_warning_and_ttl():

@@ -2,67 +2,83 @@
 
 Минимальный локальный шлюз: псевдонимизирует документ и промпт перед OpenAI и восстанавливает значения в ответе.
 
-## Запуск
+## Запуск CPU или CUDA
 
-Нужны Docker Compose с поддержкой `gpus: all` и NVIDIA GPU, доступный из Linux-контейнеров. CPU fallback отсутствует.
+Нужны Docker и Docker Compose 2.30+; локально проверен Compose 5.5.1. По умолчанию используется CUDA 12.8 и NVIDIA GPU, доступный из Linux-контейнеров. CPU запускается дополнительным Compose-файлом и не требует NVIDIA.
 
 ```powershell
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 # Заполните OPENAI_API_KEY и OPENAI_MODEL в .env локально.
-./scripts/prepare-pseudonymizer-dependencies.ps1
+# CUDA (режим по умолчанию):
 docker compose up -d --build
+# Либо CPU:
+docker compose -f compose.yaml -f compose.cpu.yaml up -d --build
 ```
 
-Зависимости pseudonymizer устанавливаются при первом старте каждого нового контейнера через `pip install -r requirements.txt`. Pip-кэш напрямую подключён с диска проекта: `.deps/pip-cache` → `/pip-cache`. При перезапуске того же контейнера установка пропускается, если файл зависимостей не изменился. После пересоздания контейнера установка выполняется снова и использует постоянный pip-кэш. Сборка образа pseudonymizer не скачивает Python/CUDA-пакеты; до завершения установки и загрузки GLiNER сервис не готов.
+Откройте http://localhost:8090. Compose задаёт `DEVICE=cuda` или `DEVICE=cpu`; при запуске Python вне Compose настройка читается из окружения и по умолчанию равна `cuda`. Другие значения отклоняются. В CUDA-режиме отсутствие GPU завершает запуск ошибкой; автоматического перехода на CPU нет. CPU-модель работает медленнее, особенно на длинных документах; тайм-ауты остаются 120 секунд.
 
-Подготовительный скрипт необязателен: он заранее устанавливает зависимости в одноразовом Linux-контейнере и наполняет тот же кэш. Установленное окружение одноразового контейнера удаляется, кэш сохраняется. Скрипт можно пропустить и выполнить сразу `docker compose up -d --build`.
+У обоих режимов один сервис, API и модель GLiNER. Переключение команды пересоздаёт pseudonymizer; таблицы замен в памяти сбрасываются. Кэш pip `.deps/pip-cache` и Docker-том `model-cache` остаются общими. Без ключа и модели OpenAI интерфейс доступен, но отправка заблокирована.
 
-PyTorch устанавливается отдельно из индекса CUDA 12.8 с `--no-deps`, а зависимости NVIDIA и остальные пакеты — с обычного PyPI. Общий `--extra-index-url` для всех пакетов не используется: ссылки на NVIDIA-файлы в CUDA-индексе могут вести на сервер с `Cache-Control: no-store`.
+Зависимости устанавливаются при первом старте нового контейнера из `pseudonymizer/requirements.cuda.txt` или `pseudonymizer/requirements.cpu.txt`. Режим и файл зависимостей входят в маркер установленного окружения: при обычном перезапуске того же контейнера установка пропускается. Сборка образа не скачивает пакеты; сервис готов после установки и загрузки модели.
 
-Кэш pip переживает `docker builder prune`, удаление образов и `docker compose down -v`, поскольку хранится в обычной папке проекта. Том модели отдельно: `down -v` удаляет его. Pip может обращаться в интернет за метаданными и использовать сохранённые HTTP-ответы и файлы пакетов. Повторное скачивание возможно, если кэш удалён, ответ сервера нельзя кешировать или нужна новая версия. Это обычный [кэш pip](https://pip.pypa.io/en/stable/topics/caching/), не гарантированная установка без сети. Старые архивы и wheels в `.deps` не используются и автоматически не удаляются.
+PyTorch устанавливается отдельно с `--no-deps` из официального индекса `cu128` либо `cpu`. Остальные зависимости ставятся с PyPI: это избегает NVIDIA-ссылок с запретом HTTP-кеширования. У CPU-сборки PyTorch нет зависимостей NVIDIA; ранее скачанные CUDA-файлы в общем кэше автоматически не удаляются.
 
-Команды пересборки:
+Кэш pip подключён напрямую с диска проекта и переживает очистку кэша Docker и удаление образов. Pip может обращаться в интернет за метаданными; [кэш pip](https://pip.pypa.io/en/stable/topics/caching/) уменьшает повторные загрузки, но не является установкой без сети. Том модели отдельно: `docker compose down -v` удаляет его.
+
+Подготовка кэша необязательна; выполняется в одноразовом Linux-контейнере без запуска сервиса:
 
 ```powershell
-docker compose build --no-cache
-docker compose up -d
-docker compose logs -f pseudonymizer
+./scripts/prepare-pseudonymizer-dependencies.ps1 -Device cuda
+# Либо CPU:
+./scripts/prepare-pseudonymizer-dependencies.ps1 -Device cpu
 ```
 
 ## Обновление зависимостей
 
-Обычный запуск использует версии из `pseudonymizer/requirements.txt`. Чтобы подготовить новые версии в пределах диапазонов `pseudonymizer/requirements.in` и CUDA 12.8:
+Общие диапазоны обновлений заданы в `pseudonymizer/requirements.in`. Кандидат сохраняется отдельно для выбранного режима, рабочие файлы не меняются:
 
 ```powershell
-./scripts/prepare-pseudonymizer-dependencies.ps1 -Mode Update
-# Просмотрите .deps/requirements.updated.txt и сравните с текущими версиями.
-git diff --no-index pseudonymizer/requirements.txt .deps/requirements.updated.txt
-# Применение — отдельное действие после просмотра:
-Copy-Item pseudonymizer/requirements.txt .deps/requirements.previous.txt
-Copy-Item .deps/requirements.updated.txt pseudonymizer/requirements.txt
-docker compose build pseudonymizer
-docker compose up -d --force-recreate pseudonymizer
-# Дождитесь healthy и проверьте модель и собственные примеры:
-docker compose ps
-Get-Content -Raw -Encoding UTF8 scripts/evaluate_model.py | docker compose exec -T web python -
+./scripts/prepare-pseudonymizer-dependencies.ps1 -Mode Update -Device cuda
+# Для CPU укажите -Device cpu; кандидат будет requirements.updated.cpu.txt.
+git diff --no-index pseudonymizer/requirements.cuda.txt .deps/requirements.updated.cuda.txt
+# После просмотра примените CUDA-кандидат:
+Copy-Item pseudonymizer/requirements.cuda.txt .deps/requirements.previous.cuda.txt
+Copy-Item .deps/requirements.updated.cuda.txt pseudonymizer/requirements.cuda.txt
+docker compose up -d --build --force-recreate pseudonymizer
 ```
 
-`Update` устанавливает кандидат в одноразовый контейнер, проверяет зависимости через `pip check` и сохраняет точные версии из `pip freeze`; рабочий файл не меняется. Это проверка разрешения зависимостей, а не проверка работы модели. Откат: восстановите `pseudonymizer/requirements.txt` из `.deps/requirements.previous.txt`, пересоберите образ и пересоздайте pseudonymizer. Не запускайте подготовку и установку сервиса одновременно с одним pip-кэшем.
+Для CPU аналогично используйте файлы с `cpu` и команду `docker compose -f compose.yaml -f compose.cpu.yaml up -d --build --force-recreate pseudonymizer`. Откат: восстановите соответствующий файл зависимостей из `.deps/requirements.previous.<режим>.txt` и пересоздайте сервис. `Update` выполняет `pip check`, но не проверяет реальную модель. Не запускайте подготовку и установку сервиса одновременно с одним кэшем.
 
-Откройте http://localhost:8090. Модель загружается при первом запуске и кешируется в volume `model-cache`; первый запуск занимает больше времени. Без ключа и модели интерфейс доступен, но отправка в OpenAI заблокирована. После изменения `.env` выполните `docker compose up -d --force-recreate web`.
+## Проверка запуска
+
+CUDA:
 
 ```powershell
 docker compose ps
 docker compose logs --tail 30 pseudonymizer
-docker compose down
+docker compose exec -T pseudonymizer python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-`down` сохраняет кеш модели. Не используйте `down -v`, если кеш нужно сохранить. Порт можно изменить через `WEB_PORT` в `.env`.
+CPU:
+
+```powershell
+docker compose -f compose.yaml -f compose.cpu.yaml ps
+docker compose -f compose.yaml -f compose.cpu.yaml logs --tail 30 pseudonymizer
+docker compose -f compose.yaml -f compose.cpu.yaml exec -T pseudonymizer python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+Дождитесь `healthy`. У CPU ожидаются версия с `+cpu` и `torch.version.cuda == None`, у CUDA — `+cu128` и доступный GPU. У внутреннего `/health/ready` поле `device` показывает выбранное устройство. Затем в обоих режимах проверьте синтетические RU/DE-примеры:
+
+```powershell
+Get-Content -Raw -Encoding UTF8 scripts/evaluate_model.py | docker compose exec -T web python -
+```
+
+Дополнительно проверьте собственные документы и время обработки длинных текстов. `docker compose down` сохраняет том модели; не добавляйте `-v`, если он нужен. Для CPU применяйте те же `-f` параметры. После изменения ключа/модели OpenAI пересоздайте web с соответствующей командой Compose. Порт меняется через `WEB_PORT` в `.env`.
 
 ## Два сервиса
 
 - `web`: FastAPI, статический интерфейс, диспетчеризация и OpenAI Responses API. Порт опубликован только на `127.0.0.1`. Документ и промпт объединяются с разделителями и обрабатываются одним вызовом.
-- `pseudonymizer`: GLiNER `urchade/gliner_multi-v2.1` на CUDA, форматные правила и таблицы замен. Нет опубликованного порта и ключа OpenAI. Один процесс; GPU-инференс последовательный.
+- `pseudonymizer`: GLiNER `urchade/gliner_multi-v2.1` на CPU или CUDA, форматные правила и таблицы замен. Нет опубликованного порта и ключа OpenAI. Один процесс; инференс последовательный.
 
 Одна кнопка выполняет `anonymize → OpenAI → deanonymize`. Справа видны параметры и полный текст запроса (`instructions` и `input`), исходный текст ответа и восстановленный текст. При сбое восстановления полученный ответ сохраняется в интерфейсе.
 
@@ -88,7 +104,7 @@ docker compose down
 
 Таблицы живут в памяти **30 минут с момента создания**, повторное чтение не продлевает срок. Перезапуск pseudonymizer удаляет все таблицы. Для одной таблицы можно восстанавливать несколько ответов до истечения срока.
 
-`GET /health/ready` у pseudonymizer проверяет загрузку модели; `GET /health` у web сообщает состояние конфигурации без значений ключа. Внешний API диспетчера: `POST /api/process` с `document` и `prompt`.
+`GET /health/ready` у pseudonymizer проверяет загрузку модели и возвращает `device`; `GET /health` у web сообщает состояние конфигурации без значений ключа. Внешний API диспетчера: `POST /api/process` с `document` и `prompt`.
 
 ## Границы MVP
 
@@ -108,7 +124,7 @@ docker run --rm --mount "type=bind,source=$PWD,target=/checks" -w /checks persda
 
 Для локального запуска используйте Python 3.11, виртуальное окружение и `requirements-dev.txt`.
 
-Unit/API-тесты используют подменённые детектор и OpenAI и не требуют Torch, GPU, ключа или платных API-вызовов. CUDA, реальная модель и качество распознавания проверяются отдельно внутри Docker.
+Unit/API-тесты используют подменённые детектор и OpenAI и не требуют Torch, GPU, ключа или платных API-вызовов. CPU/CUDA, реальная модель и качество распознавания проверяются отдельно внутри Docker.
 
 После готовности pseudonymizer выполните оценку на синтетических русских и немецких примерах:
 

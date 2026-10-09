@@ -1,0 +1,5 @@
+services:
+  pseudonymizer:
+    gpus: !reset []
+    environment:
+      DEVICE: cpu

@@ -9,22 +9,28 @@ import subprocess
 import sys
 
 from pseudonymizer.dependencies import install_dependencies
+from pseudonymizer.config import get_device
 
 
 APP_DIR = Path(__file__).resolve().parent
-REQUIREMENTS = APP_DIR / "requirements.txt"
+REQUIREMENTS = {
+    "cpu": APP_DIR / "requirements.cpu.txt",
+    "cuda": APP_DIR / "requirements.cuda.txt",
+}
 INSTALL_MARKER = Path("/tmp/pseudonymizer-requirements.sha256")
 
 
 def main() -> None:
-    requirements_hash = hashlib.sha256(REQUIREMENTS.read_bytes()).hexdigest()
+    device = get_device()
+    requirements = REQUIREMENTS[device]
+    requirements_hash = f"{device}:{hashlib.sha256(requirements.read_bytes()).hexdigest()}"
     if not INSTALL_MARKER.exists() or INSTALL_MARKER.read_text().strip() != requirements_hash:
         print(
-            "Installing dependencies: PyTorch from the CUDA index, other packages from PyPI; "
+            f"Installing {device} dependencies: PyTorch from its selected index, other packages from PyPI; "
             "pip uses /pip-cache.",
             flush=True,
         )
-        install_dependencies(REQUIREMENTS)
+        install_dependencies(requirements, device=device)
         subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
         INSTALL_MARKER.write_text(requirements_hash)
     else:

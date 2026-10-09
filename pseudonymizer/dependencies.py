@@ -1,4 +1,4 @@
-"""Install the CUDA PyTorch wheel separately from packages served by PyPI."""
+"""Install the selected PyTorch wheel separately from packages served by PyPI."""
 
 from __future__ import annotations
 
@@ -11,7 +11,10 @@ import sys
 import tempfile
 
 
-CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
+TORCH_INDEXES = {
+    "cpu": "https://download.pytorch.org/whl/cpu",
+    "cuda": "https://download.pytorch.org/whl/cu128",
+}
 PYPI_INDEX = "https://pypi.org/simple"
 PIP_CACHE = os.environ.get("PIP_CACHE_DIR", "/pip-cache")
 TORCH_LINE = re.compile(r"^\s*torch(?:\[[^]]+\])?\s*(?P<spec>[<>=!~].*)$", re.IGNORECASE)
@@ -33,26 +36,30 @@ def _pip(*args: str) -> None:
     )
 
 
-def install_dependencies(requirements: Path, upgrade: bool = False) -> str:
-    """Install CUDA 12.8 torch from its index, then resolve everything else on PyPI.
+def install_dependencies(requirements: Path, device: str = "cuda", upgrade: bool = False) -> str:
+    """Install selected torch from its index, then resolve remaining packages on PyPI.
 
     Returns the selected torch version. Requirements may contain legacy index
     directives; these are omitted from the PyPI-only requirements passed to pip.
     """
+    if device not in TORCH_INDEXES:
+        raise ValueError(f"Unsupported device {device!r}; expected 'cpu' or 'cuda'")
+
     lines = requirements.read_text(encoding="utf-8").splitlines()
     torch_line = next((line.strip() for line in lines if TORCH_LINE.match(line)), None)
     if torch_line is None:
         raise ValueError(f"{requirements} must contain a torch version requirement")
 
-    torch_args = ["install", "--no-deps", "--only-binary=:all:", "--index-url", CUDA_INDEX]
+    torch_args = ["install", "--no-deps", "--only-binary=:all:", "--index-url", TORCH_INDEXES[device]]
     if upgrade:
         torch_args.append("--upgrade")
     torch_args.append(torch_line)
     _pip(*torch_args)
 
     torch_version = importlib.metadata.version("torch")
-    if not torch_version.endswith("+cu128"):
-        raise RuntimeError(f"Expected a CUDA 12.8 PyTorch build; got {torch_version}")
+    expected_suffix = "+cpu" if device == "cpu" else "+cu128"
+    if not torch_version.endswith(expected_suffix):
+        raise RuntimeError(f"Expected a PyTorch {device} build ending in {expected_suffix}; got {torch_version}")
 
     clean_lines: list[str] = []
     for line in lines:

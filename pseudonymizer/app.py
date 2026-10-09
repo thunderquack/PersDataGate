@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from .config import get_device
 from .service import MAX_TEXT_LENGTH, MappingStore, anonymize_text, expires_iso, restore_text
 
 MAX_RESPONSE_LENGTH = 3_000_000
@@ -42,6 +43,8 @@ class GLiNERDetector:
 def create_app(detector: Any | None = None, store: MappingStore | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        device = get_device()
+        logger.info("Initializing GLiNER on %s", device)
         if detector is not None:
             app.state.detector = detector
         else:
@@ -50,7 +53,7 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None) -
                 from gliner import GLiNER
                 from huggingface_hub import snapshot_download
 
-                if not torch.cuda.is_available():
+                if device == "cuda" and not torch.cuda.is_available():
                     raise RuntimeError("CUDA GPU is required but torch.cuda.is_available() is false")
                 cache_dir = os.getenv("HF_HOME", "/models/huggingface")
                 model_snapshot = snapshot_download(
@@ -64,14 +67,15 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None) -
                     max_length=384,
                     cache_dir=cache_dir,
                 )
-                model.to("cuda")
+                model.to(device)
                 model.eval()
                 app.state.detector = GLiNERDetector(model, torch.inference_mode)
             except Exception as exc:
                 logger.error("GLiNER startup failed (%s)", type(exc).__name__)
-                raise RuntimeError(f"Could not initialize CUDA GLiNER: {exc}") from exc
+                raise RuntimeError(f"Could not initialize GLiNER on {device}: {exc}") from exc
         app.state.store = store or MappingStore()
         app.state.inference_lock = threading.Lock()
+        app.state.device = device
         app.state.ready = True
         yield
         app.state.ready = False
@@ -82,10 +86,10 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None) -
     app = FastAPI(title="PersDataGate Pseudonymizer", lifespan=lifespan)
 
     @app.get("/health/ready")
-    async def readiness() -> dict[str, bool]:
+    async def readiness() -> dict[str, bool | str]:
         if not getattr(app.state, "ready", False):
             raise HTTPException(status_code=503, detail="model_not_ready")
-        return {"ready": True}
+        return {"ready": True, "device": app.state.device}
 
     @app.post("/anonymize")
     def anonymize(request: AnonymizeRequest) -> dict[str, str]:

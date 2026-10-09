@@ -6,7 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_CACHE_DIR=/pip-cache
 
 WORKDIR /app
-COPY pseudonymizer/requirements.txt /app/pseudonymizer/requirements.txt
+COPY pseudonymizer/requirements.cpu.txt /app/pseudonymizer/requirements.cpu.txt
+COPY pseudonymizer/requirements.cuda.txt /app/pseudonymizer/requirements.cuda.txt
 COPY pseudonymizer /app/pseudonymizer
 
 EXPOSE 8000

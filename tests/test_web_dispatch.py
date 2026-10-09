@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import httpx
 from openai import AsyncOpenAI
 from fastapi.testclient import TestClient
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from pseudonymizer.app import create_app as create_pseudonymizer_app
@@ -179,7 +179,7 @@ def test_local_model_context_limit_is_413_with_counts_guid_and_no_openai_call(mo
         pseudo_api = FastAPI()
 
         @pseudo_api.post("/anonymize")
-        async def anonymize(request):
+        async def anonymize(request: Request):
             observed_pipeline_ids.append(request.headers.get("X-Pipeline-ID"))
             return JSONResponse(status_code=413, content={"detail": {
                 "code": "local_model_context_exceeded", "input_tokens": 45_123,
@@ -204,7 +204,7 @@ def test_local_model_context_limit_is_413_with_counts_guid_and_no_openai_call(mo
         return response, openai
 
     response, openai = asyncio.run(scenario())
-    assert response.status_code == 413
+    assert response.status_code == 413, response.text
     body = response.json()
     assert body["pipeline_id"] == pipeline_id
     assert body["error"] == {

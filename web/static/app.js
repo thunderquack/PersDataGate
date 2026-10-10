@@ -4,7 +4,22 @@ let pipelineId = "";
 
 function setText(id, text, empty = false) {
   const node = $(id);
-  node.textContent = text;
+  if (node.tagName === "PRE" && !empty) {
+    const content = document.createDocumentFragment();
+    let cursor = 0;
+    for (const match of text.matchAll(/⟦[^⟦⟧\r\n]{1,120}⟧/gu)) {
+      content.append(document.createTextNode(text.slice(cursor, match.index)));
+      const marker = document.createElement("mark");
+      marker.className = "placeholder";
+      marker.textContent = match[0];
+      content.append(marker);
+      cursor = match.index + match[0].length;
+    }
+    content.append(document.createTextNode(text.slice(cursor)));
+    node.replaceChildren(content);
+  } else {
+    node.textContent = text;
+  }
   node.classList.toggle("empty", empty);
 }
 

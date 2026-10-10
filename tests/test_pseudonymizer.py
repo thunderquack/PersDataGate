@@ -70,10 +70,22 @@ def test_repeated_unicode_values_share_marker_and_restore_once():
     ]})
     masked, mapping = anonymize_text(source, detector)
     marker = next(iter(mapping))
+    assert marker == "⟦PERSON_1⟧"
     assert masked.count(marker) == 2
     assert mapping[marker] == "Юлия Müller"
     restored, warnings = restore_text(f"Ответ: {marker}; вложенный ⟦OTHER_" + "a" * 32 + "_1⟧", mapping)
     assert restored == "Ответ: Юлия Müller; вложенный ⟦OTHER_" + "a" * 32 + "_1⟧"
+    assert len(warnings) == 1
+
+
+def test_short_marker_does_not_collide_with_existing_source_marker():
+    source = "Literal ⟦PERSON_1⟧; Иван Петров"
+    detector = FakeDetector({source: [entity("Иван Петров", "person", source)]})
+    masked, mapping = anonymize_text(source, detector)
+    assert masked == "Literal ⟦PERSON_1⟧; ⟦PERSON_2⟧"
+    assert mapping == {"⟦PERSON_2⟧": "Иван Петров"}
+    restored, warnings = restore_text(masked, mapping)
+    assert restored == source
     assert len(warnings) == 1
 
 
@@ -237,7 +249,7 @@ def test_api_round_trip_ttl_and_mapping_isolation():
     detector = FakeDetector({source: []})
     with TestClient(create_app(detector=detector, store=store)) as client:
         first = client.post("/anonymize", json={"text": source})
-        second = client.post("/anonymize", json={"text": source})
+        second = client.post("/anonymize", json={"text": "Contact b@example.org"})
         assert first.status_code == second.status_code == 200
         first_body, second_body = first.json(), second.json()
         assert first_body["mapping_id"] != second_body["mapping_id"]
@@ -246,8 +258,9 @@ def test_api_round_trip_ttl_and_mapping_isolation():
         roundtrip = client.post("/deanonymize", json={"mapping_id": first_body["mapping_id"], "text": first_body["text"]})
         assert roundtrip.json()["text"] == source
         isolated = client.post("/deanonymize", json={"mapping_id": second_body["mapping_id"], "text": first_body["text"]})
-        assert isolated.json()["text"] == first_body["text"]
-        assert isolated.json()["warnings"]
+        assert first_body["text"] == second_body["text"] == "Contact ⟦EMAIL_1⟧"
+        assert isolated.json()["text"] == "Contact b@example.org"
+        assert isolated.json()["warnings"] == []
         clock[0] = 15.0
         expired = client.post("/deanonymize", json={"mapping_id": first_body["mapping_id"], "text": first_body["text"]})
         assert expired.status_code == 404

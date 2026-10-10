@@ -379,10 +379,18 @@ def anonymize_text(text: str, model: Any, pipeline: Any | None = None, *,
         ]
     mapping = PseudonymMapping()
     value_markers: dict[tuple[str, str], str] = {}
-    nonce = uuid.uuid4().hex
     pieces: list[str] = []
     cursor = 0
     counters: dict[str, int] = {}
+    reserved_markers = set(_MARKER.findall(text))
+
+    def next_marker(code: str) -> str:
+        while True:
+            counters[code] = counters.get(code, 0) + 1
+            marker = f"⟦{code}_{counters[code]}⟧"
+            if marker not in reserved_markers:
+                return marker
+
     assignments: dict[int, Any] = {}
     if pipeline is not None:
         person_spans = [span for span in spans if span.code == "PERSON"]
@@ -397,8 +405,7 @@ def anonymize_text(text: str, model: Any, pipeline: Any | None = None, *,
         if record is not None:
             marker = value_markers.get(("PERSON_ID", record.identifier))
             if marker is None:
-                counters["PERSON"] = counters.get("PERSON", 0) + 1
-                marker = f"⟦PERSON_{nonce}_{counters['PERSON']}⟧"
+                marker = next_marker("PERSON")
                 value_markers[("PERSON_ID", record.identifier)] = marker
                 mapping[marker] = record.canonical
                 mapping.persons[marker] = record
@@ -407,8 +414,7 @@ def anonymize_text(text: str, model: Any, pipeline: Any | None = None, *,
             if key in value_markers:
                 marker = value_markers[key]
             else:
-                counters[span.code] = counters.get(span.code, 0) + 1
-                marker = f"⟦{span.code}_{nonce}_{counters[span.code]}⟧"
+                marker = next_marker(span.code)
                 value_markers[key] = marker
                 mapping[marker] = span.value
         pieces.extend((text[cursor : span.start], marker))

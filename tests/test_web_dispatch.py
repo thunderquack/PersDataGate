@@ -228,23 +228,32 @@ def test_person_group_context_overflow_stops_before_openai(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_MODEL", "test-model")
 
-    class TwoMentionDetector:
+    class FourMentionDetector:
         def predict_entities(self, text, labels, threshold):
             return [{"text": match.group(), "label": "person name", "start": match.start(),
                      "end": match.end(), "score": 0.99}
-                    for match in re.finditer(r"Alice Example|A\. Example", text)]
+                    for match in re.finditer(r"Alice Example|A\. Example|Bob Example|B\. Example", text)]
 
     class ContextGenerator:
+        def __init__(self):
+            self.calls = 0
+
         def check_input(self, system, payload):
             return 10
 
         def choose(self, system, payload):
             assert payload["task"] == "link_person_mentions"
+            self.calls += 1
+            if self.calls == 1:
+                assert payload["anchor_id"] == "m1"
+                return {"same_person_ids": ["m2"]}
+            assert payload["anchor_id"] == "m3"
+            assert payload["allowed_same_person_ids"] == ["m4"]
             raise ContextLimitError(45_001, 40_704, 40_960)
 
     async def scenario():
         pseudo_api = create_pseudonymizer_app(
-            detector=TwoMentionDetector(), pipeline=PersonPipeline(ContextGenerator())
+            detector=FourMentionDetector(), pipeline=PersonPipeline(ContextGenerator())
         )
         pseudo_http = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=pseudo_api), base_url="http://pseudonymizer"
@@ -258,7 +267,8 @@ def test_person_group_context_overflow_stops_before_openai(monkeypatch):
                     transport=httpx.ASGITransport(app=web_app), base_url="http://web"
                 ) as browser:
                     response = await browser.post("/api/process", json={
-                        "prompt": "Summarize", "document": "Alice Example met A. Example",
+                        "prompt": "Summarize",
+                        "document": "Alice Example met A. Example; Bob Example met B. Example",
                     })
         await pseudo_http.aclose()
         return response, openai

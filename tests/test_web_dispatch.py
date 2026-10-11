@@ -349,7 +349,7 @@ def test_downstream_mapping_404_preserves_received_and_sent_text(monkeypatch):
     assert body["received_text"] == "[received answer]"
     assert body["sent_request"] == {
         "model": "test-model", "instructions": OPENAI_INSTRUCTIONS,
-        "input": "[masked]", "store": False,
+        "input": "[ПРОМПТ]\np\n\n[ДОКУМЕНТ]\n[masked]", "store": False,
     }
     assert "private source" not in response.text
 
@@ -386,7 +386,7 @@ def test_actual_sdk_auth_401_returns_safe_message_without_upstream_error_or_key(
     assert body["error"]["code"] == "openai_authentication_failed"
     assert body["prepared_text"] == "[masked document]"
     assert body["received_text"] == ""
-    assert body["sent_request"]["input"] == "[masked document]"
+    assert body["sent_request"]["input"] == "[ПРОМПТ]\np\n\n[ДОКУМЕНТ]\n[masked document]"
     assert "synthetic-secret-key" not in response.text
     assert "sk-test-private-value" not in response.text
     assert "Incorrect API key provided" not in response.text
@@ -444,8 +444,13 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
                     request_bytes = await request.aread()
                     request_body = json.loads(request_bytes)
                     captured.append({"path": request.url.path, **request_body})
-                    assert "Alice Example" not in request_body["input"]
                     assert "alice@example.org" not in request_body["input"]
+                    assert request_body["input"].startswith(
+                        "[ПРОМПТ]\nSummarize for Alice Example\n\n[ДОКУМЕНТ]\n"
+                    )
+                    assert "Alice Example" not in request_body["input"].split(
+                        "[ДОКУМЕНТ]\n", 1
+                    )[1]
                     assert "opaque-map-id" not in request_bytes.decode("utf-8")
                     marker = re.search(r"⟦[^⟦⟧]+⟧", request_body["input"]).group()
                     response_body = {
@@ -491,7 +496,10 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
     assert wire["model"] == "gpt-4o-mini"
     assert wire["store"] is False
     assert "temperature" not in wire
-    assert "Alice Example" not in json.dumps(wire)
+    assert wire["input"].startswith(
+        "[ПРОМПТ]\nSummarize for Alice Example\n\n[ДОКУМЕНТ]\n"
+    )
+    assert "Alice Example" not in wire["input"].split("[ДОКУМЕНТ]\n", 1)[1]
     assert "alice@example.org" not in json.dumps(wire)
     assert "mapping_id" not in wire
     assert all(mapping_id not in json.dumps(wire) for mapping_id in mapping_ids)

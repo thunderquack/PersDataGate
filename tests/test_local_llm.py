@@ -222,7 +222,16 @@ def test_input_exactly_at_model_budget_is_allowed(monkeypatch, tmp_path):
     assert len(calls["generate"]) == 1
 
 
-def test_preflight_uses_exact_rendered_input_at_budget_without_generating(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "mentions",
+    [
+        [],
+        [{"id": "m1", "value": "Alice Example", "start": 0, "end": 13}],
+    ],
+)
+def test_preflight_uses_exact_rendered_input_at_budget_without_generating(
+    monkeypatch, tmp_path, mentions
+):
     events = []
     monkeypatch.setattr("pseudonymizer.local_llm.event", lambda name, data: events.append((name, data)))
     calls = mocked_transformers(
@@ -234,7 +243,7 @@ def test_preflight_uses_exact_rendered_input_at_budget_without_generating(monkey
     generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
     payload = {
         "document": "Alice Example lives in Berlin.",
-        "mentions": [{"id": "m1", "value": "Alice Example", "start": 0, "end": 13}],
+        "mentions": mentions,
         "groups": [],
         "allowed_assignments": ["new", "unknown"],
     }

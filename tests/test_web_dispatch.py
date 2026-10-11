@@ -9,6 +9,7 @@ from uuid import UUID
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from openai import AsyncOpenAI
 from fastapi.testclient import TestClient
 from fastapi import FastAPI, Request
@@ -218,6 +219,77 @@ def test_local_model_context_limit_is_413_with_counts_guid_and_no_openai_call(mo
     assert body["prepared_text"] == ""
     assert body["received_text"] == ""
     assert "private source text" not in response.text
+
+
+@pytest.mark.parametrize("failure_phase", ["first", "retry", "validation"])
+def test_person_group_context_overflow_in_each_generation_phase_stops_before_openai(
+    monkeypatch, failure_phase
+):
+    from pseudonymizer.local_llm import ContextLimitError
+    from pseudonymizer.persons import PersonPipeline
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+
+    class TwoMentionDetector:
+        def predict_entities(self, text, labels, threshold):
+            return [{"text": match.group(), "label": "person name", "start": match.start(),
+                     "end": match.end(), "score": 0.99}
+                    for match in re.finditer(r"Alice Example|A\. Example", text)]
+
+    class ContextGenerator:
+        def __init__(self):
+            self.assignment_count = 0
+
+        def check_input(self, system, payload):
+            return 10
+
+        def choose(self, system, payload):
+            task = payload["task"]
+            if failure_phase == "first" and task == "assign_person":
+                raise ContextLimitError(45_001, 40_704, 40_960)
+            if task == "assign_person":
+                self.assignment_count += 1
+                if failure_phase == "retry":
+                    return {"assignment": "unknown"}
+                return {"assignment": "entity_1"}
+            if failure_phase == "retry" and task == "retry_person":
+                raise ContextLimitError(45_002, 40_704, 40_960)
+            if failure_phase == "validation" and task == "validate_group_member":
+                raise ContextLimitError(45_003, 40_704, 40_960)
+            return {"relation": "same"}
+
+    async def scenario():
+        pseudo_api = create_pseudonymizer_app(
+            detector=TwoMentionDetector(), pipeline=PersonPipeline(ContextGenerator())
+        )
+        pseudo_http = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=pseudo_api), base_url="http://pseudonymizer"
+        )
+        pseudo_client = PseudonymizerClient("http://pseudonymizer", client=pseudo_http)
+        openai = FakeOpenAI()
+        web_app = create_app(pseudonymizer=pseudo_client, openai_client=openai)
+        async with pseudo_api.router.lifespan_context(pseudo_api):
+            async with web_app.router.lifespan_context(web_app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=web_app), base_url="http://web"
+                ) as browser:
+                    response = await browser.post("/api/process", json={
+                        "prompt": "Summarize", "document": "Alice Example met A. Example",
+                    })
+        await pseudo_http.aclose()
+        return response, openai
+
+    response, openai = asyncio.run(scenario())
+    assert response.status_code == 413, response.text
+    body = response.json()
+    assert body["error"]["stage"] == "anonymize"
+    assert body["error"]["code"] == "local_model_context_exceeded"
+    assert body["error"]["input_tokens"] in {45_001, 45_002, 45_003}
+    assert "Запрос в OpenAI не отправлен." in body["error"]["message"]
+    assert openai.responses.calls == []
+    assert body["prepared_text"] == ""
+    assert body["received_text"] == ""
 
 
 def test_restore_failure_keeps_both_masked_request_and_received_answer(monkeypatch):

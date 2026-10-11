@@ -279,14 +279,16 @@ def test_rejects_prose_duplicate_keys_and_non_object_json(monkeypatch, tmp_path,
         generator.choose("instructions", {"id": "p1"})
 
 
-def test_returns_json_values_for_caller_semantic_validation(monkeypatch, tmp_path):
-    # The generator parses JSON only; the person pipeline must check that this
-    # choice belongs to the candidate IDs it supplied.
-    mocked_transformers(monkeypatch, response=json.dumps({"person_id": "not-an-offered-id"}))
+def test_returns_assignment_json_for_caller_semantic_validation(monkeypatch, tmp_path):
+    # Constrained decoding narrows valid outputs; the person pipeline still
+    # validates model results against its offered assignment IDs.
+    mocked_transformers(monkeypatch, response=json.dumps({"assignment": "not-an-offered-id"}))
     generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
 
-    assert generator.choose("Choose an offered person", {"allowed_ids": ["p1"]}) == {
-        "person_id": "not-an-offered-id"
+    assert generator.choose("Choose an offered group", {
+        "allowed_assignments": ["entity_1", "new", "unknown"],
+    }) == {
+        "assignment": "not-an-offered-id"
     }
 
 

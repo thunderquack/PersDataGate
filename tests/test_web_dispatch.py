@@ -466,7 +466,7 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
         def predict_entities(self, text, labels, threshold):
             return [{"text": match.group(), "label": "person name", "start": match.start(),
                      "end": match.end(), "score": 0.99}
-                    for match in re.finditer(r"Alice Example", text)]
+                    for match in re.finditer(r"Alice Example|Bob Example", text)]
 
     from pseudonymizer.persons import PersonPipeline
 
@@ -480,7 +480,7 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
 
         def choose(self, system, payload):
             self.payloads.append(payload)
-            return {"same_person_ids": ["m2"]}
+            return {"same_person_ids": []}
 
     linker = RecordingLinker()
 
@@ -549,7 +549,7 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
                 ) as browser:
                     response = await browser.post("/api/process", json={
                         "prompt": "Summarize for Alice Example",
-                        "document": "Alice ExampleAlice Example: alice@example.org",
+                        "document": "Alice ExampleAlice Example; Bob Example: alice@example.org",
                     })
             await sdk_client.close()
             await pseudo_http.aclose()
@@ -575,14 +575,23 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
         "input": wire["input"], "store": False,
     }
     assert linker.payloads[0]["document"] == (
-        "⟦m1⟧ Alice Example⟦m2⟧ Alice Example: alice@example.org"
+        "⟦m1⟧ Alice Example⟦m1⟧ Alice Example; ⟦m2⟧ Bob Example: alice@example.org"
     )
     assert linker.payloads[0]["mentions"] == [
-        {"id": "m1", "value": "Alice Example", "start": 5, "end": 18,
-         "source_start": 0, "source_end": 13},
-        {"id": "m2", "value": "Alice Example", "start": 23, "end": 36,
-         "source_start": 13, "source_end": 26},
+        {"id": "m1", "value": "Alice Example", "observed_values": ["Alice Example"],
+         "start": 5, "end": 18, "source_start": 0, "source_end": 13,
+         "occurrences": [
+             {"value": "Alice Example", "start": 5, "end": 18, "source_start": 0, "source_end": 13},
+             {"value": "Alice Example", "start": 23, "end": 36, "source_start": 13, "source_end": 26},
+         ]},
+        {"id": "m2", "value": "Bob Example", "observed_values": ["Bob Example"],
+         "start": 43, "end": 54, "source_start": 28, "source_end": 39,
+         "occurrences": [
+             {"value": "Bob Example", "start": 43, "end": 54, "source_start": 28, "source_end": 39},
+         ]},
     ]
+    assert linker.payloads[0]["allowed_same_person_ids"] == ["m2"]
+    assert linker.payloads[0]["remaining_candidates"] == [linker.payloads[0]["mentions"][1]]
     assert not re.search(r"⟦m\d+⟧", wire["input"])
     assert body["received_text"].startswith("Hello ⟦PERSON_")
     assert body["restored_text"] == "Hello Alice Example"

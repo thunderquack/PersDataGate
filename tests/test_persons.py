@@ -141,10 +141,11 @@ def test_inline_ids_bind_repeated_adjacent_unicode_occurrences_without_changing_
     payload = generator.preflight_calls[0][1]
     assert payload["document"] == "⟦m1⟧ Éva⟦m1⟧ Éva"
     assert payload["mentions"] == [
-        {"id": "m1", "value": "Éva", "start": 5, "end": 8,
+        {"id": "m1", "value": "Éva", "observed_values": ["Éva"],
+         "start": 5, "end": 8,
          "source_start": 0, "source_end": 3, "occurrences": [
-             {"start": 5, "end": 8, "source_start": 0, "source_end": 3},
-             {"start": 13, "end": 16, "source_start": 3, "source_end": 6},
+             {"value": "Éva", "start": 5, "end": 8, "source_start": 0, "source_end": 3},
+             {"value": "Éva", "start": 13, "end": 16, "source_start": 3, "source_end": 6},
          ]},
     ]
     row = payload["mentions"][0]
@@ -167,11 +168,12 @@ def test_exact_raw_repeats_share_an_id_before_model_and_keep_every_source_start(
     payload = generator.preflight_calls[0][1]
     assert payload["document"] == "⟦m1⟧ John Smith; ⟦m1⟧ John Smith"
     assert payload["mentions"] == [{
-        "id": "m1", "value": "John Smith", "start": 5, "end": 15,
+        "id": "m1", "value": "John Smith", "observed_values": ["John Smith"],
+        "start": 5, "end": 15,
         "source_start": 0, "source_end": 10,
         "occurrences": [
-            {"start": 5, "end": 15, "source_start": 0, "source_end": 10},
-            {"start": 22, "end": 32, "source_start": 12, "source_end": 22},
+            {"value": "John Smith", "start": 5, "end": 15, "source_start": 0, "source_end": 10},
+            {"value": "John Smith", "start": 22, "end": 32, "source_start": 12, "source_end": 22},
         ],
     }]
     assert set(records) == {0, 12}
@@ -224,9 +226,10 @@ def test_model_selection_of_one_unique_id_maps_all_of_its_exact_occurrences():
     assert [row["id"] for row in payload["mentions"]] == ["m1", "m2"]
     assert payload["allowed_same_person_ids"] == ["m2"]
     assert payload["remaining_candidates"] == [payload["mentions"][1]]
+    assert payload["mentions"][0]["observed_values"] == ["John Smith"]
     assert payload["mentions"][0]["occurrences"] == [
-        {"start": 5, "end": 15, "source_start": 0, "source_end": 10},
-        {"start": 22, "end": 32, "source_start": 12, "source_end": 22},
+        {"value": "John Smith", "start": 5, "end": 15, "source_start": 0, "source_end": 10},
+        {"value": "JOHN SMITH", "start": 22, "end": 32, "source_start": 12, "source_end": 22},
     ]
     assert set(records) == {0, 12, 24}
     assert len({record.identifier for record in records.values()}) == 1
@@ -263,20 +266,21 @@ def test_each_anchor_call_is_bounded_by_mentions_and_uncertain_choices_remain_si
         assert payloads[0]["document"][row["start"]:row["end"]] == row["value"]
 
 
-def test_repeated_spellings_can_be_separate_and_name_similarity_does_not_override_model():
+def test_exact_repeat_pregrouping_and_model_can_link_linguistically_dissimilar_names():
     text = "John Smith; John Smith; Иван Иванович Петров; Иван Петрович Петров"
     spans = person_spans(
         text, "John Smith", "John Smith", "Иван Иванович Петров", "Иван Петрович Петров"
     )
-    # First pair split; last two joined to the third source-order anchor.
-    generator = ScriptedGenerator(selections=[[], [], ["m4"]])
+    # The exact John repeat is pregrouped; the model separately links the Russian variants.
+    generator = ScriptedGenerator(selections=[[], ["m3"]])
 
     records, warnings = PersonPipeline(generator).link(text, spans)
 
     assert warnings == []
-    assert records[spans[0].start].identifier != records[spans[1].start].identifier
+    assert records[spans[0].start].identifier == records[spans[1].start].identifier
+    assert records[spans[1].start].identifier != records[spans[2].start].identifier
     assert records[spans[2].start].identifier == records[spans[3].start].identifier
-    assert len(generator.calls) == 3
+    assert len(generator.calls) == 2
 
 
 @pytest.mark.parametrize("response", [

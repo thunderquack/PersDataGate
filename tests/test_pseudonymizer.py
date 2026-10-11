@@ -102,7 +102,7 @@ def test_inline_qwen_mention_ids_never_leak_into_anonymized_api_text(monkeypatch
 
         def choose(self, system, payload):
             self.payloads.append(payload)
-            return {"same_person_ids": ["m2"]}
+        return {"same_person_ids": []}
 
     generator = SamePersonGenerator()
     with TestClient(create_app(
@@ -116,10 +116,15 @@ def test_inline_qwen_mention_ids_never_leak_into_anonymized_api_text(monkeypatch
     assert body["text"].count("⟦m") == 0
     assert "⟦m1⟧" not in response.text and "⟦m2⟧" not in response.text
     assert "Éva" not in response.text
-    assert generator.payloads[0]["document"] == "⟦m1⟧ Éva⟦m2⟧ Éva"
+    assert generator.payloads[0]["document"] == "⟦m1⟧ Éva⟦m1⟧ Éva"
     rows = generator.payloads[0]["mentions"]
     assert [(row["start"], row["end"], row["source_start"], row["source_end"])
-            for row in rows] == [(5, 8, 0, 3), (13, 16, 3, 6)]
+            for row in rows] == [(5, 8, 0, 3)]
+    assert rows[0]["observed_values"] == ["Éva"]
+    assert rows[0]["occurrences"] == [
+        {"value": "Éva", "start": 5, "end": 8, "source_start": 0, "source_end": 3},
+        {"value": "Éva", "start": 13, "end": 16, "source_start": 3, "source_end": 6},
+    ]
 
 
 def test_short_marker_does_not_collide_with_existing_source_marker():

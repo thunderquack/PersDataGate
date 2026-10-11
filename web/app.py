@@ -132,7 +132,7 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
             raise ApiError("configuration", "openai_not_configured", "Для обработки задайте OPENAI_API_KEY и OPENAI_MODEL.")
         prepared = ""
         try:
-            anonymized = await request.app.state.pseudonymizer.anonymize(combined)
+            anonymized = await request.app.state.pseudonymizer.anonymize(body.document)
             event("web.anonymized", anonymized)
             mapping_id, prepared = anonymized["mapping_id"], anonymized["text"]
             request.state.processing_steps.update(anonymized.get("steps", {}))
@@ -154,7 +154,7 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
                     if all(isinstance(value, int) and not isinstance(value, bool)
                            for value in values.values()):
                         message = (
-                            "Документ и промпт превышают контекст локальной модели: "
+                            "Документ и служебные данные не помещаются в контекст локальной модели: "
                             f"{values['input_tokens']} токенов при лимите ввода "
                             f"{values['maximum_input_tokens']} (окно контекста "
                             f"{values['context_window']}). Запрос в OpenAI не отправлен."
@@ -168,12 +168,13 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
         except Exception:
             raise ApiError("anonymize", "pseudonymizer_unavailable",
                            "Не удалось псевдонимизировать текст. Запрос в OpenAI не отправлен.") from None
+        openai_input = f"[ПРОМПТ]\n{body.prompt}\n\n[ДОКУМЕНТ]\n{prepared}"
         sent_request = {"model": model, "instructions": OPENAI_INSTRUCTIONS,
-                        "input": prepared, "store": False}
+                        "input": openai_input, "store": False}
         event("openai.request", {**sent_request, "timeout": TIMEOUT_SECONDS})
         try:
             result = await request.app.state.openai_client.responses.create(
-                model=model, instructions=OPENAI_INSTRUCTIONS, input=prepared, store=False,
+                model=model, instructions=OPENAI_INSTRUCTIONS, input=openai_input, store=False,
                 timeout=TIMEOUT_SECONDS,
             )
             received = result.output_text

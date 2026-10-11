@@ -88,13 +88,34 @@ function clearSteps() {
   setText("prepared", "Ожидание данных этапа.", true);
 }
 
+function createPipelineId() {
+  const secureCrypto = globalThis.crypto;
+  if (!secureCrypto) {
+    throw new Error("Браузер не поддерживает безопасную генерацию GUID. Откройте интерфейс через HTTPS или localhost.");
+  }
+  if (typeof secureCrypto.randomUUID === "function") return secureCrypto.randomUUID();
+  if (typeof secureCrypto.getRandomValues !== "function") {
+    throw new Error("Браузер не поддерживает безопасную генерацию GUID. Откройте интерфейс через HTTPS или localhost.");
+  }
+  const bytes = new Uint8Array(16);
+  secureCrypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 $("process").addEventListener("click", async () => {
-  const button = $("process"); button.disabled = true; receivedText = ""; restoredText = ""; sentRequest = null;
-  pipelineId = crypto.randomUUID();
-  $("status").className = ""; $("status").textContent = `Обработка… · GUID: ${pipelineId}`; $("warnings").textContent = "";
-  clearSteps();
-  setText("request", "Ожидание результата…", true); setText("received", "Ожидание ответа…", true); setText("restored", "Ожидание восстановления…", true);
+  const button = $("process");
+  pipelineId = "";
   try {
+    button.disabled = true;
+    receivedText = ""; restoredText = ""; sentRequest = null;
+    $("status").className = ""; $("status").textContent = "Подготовка запроса…"; $("warnings").textContent = "";
+    clearSteps();
+    setText("request", "Ожидание результата…", true); setText("received", "Ожидание ответа…", true); setText("restored", "Ожидание восстановления…", true);
+    pipelineId = createPipelineId();
+    $("status").textContent = `Обработка… · GUID: ${pipelineId}`;
     const response = await fetch("/api/process", {method:"POST", headers:{"Content-Type":"application/json", "X-Pipeline-ID":pipelineId}, body:JSON.stringify({document:$("document").value,prompt:$("prompt").value})});
     const result = await response.json();
     pipelineId = result.pipeline_id || response.headers.get("X-Pipeline-ID") || pipelineId;
@@ -108,7 +129,7 @@ $("process").addEventListener("click", async () => {
     if (!response.ok) throw new Error(result.error?.message || "Не удалось обработать текст.");
     $("status").textContent = `Готово · GUID: ${pipelineId}`;
   } catch (error) {
-    $("status").className = "error"; $("status").textContent = `${error.message || "Ошибка обработки."} · GUID: ${pipelineId}`;
+    $("status").className = "error"; $("status").textContent = `${error.message || "Ошибка обработки."}${pipelineId ? ` · GUID: ${pipelineId}` : ""}`;
     if (!sentRequest && !$("request").textContent.includes("Подготовленный")) setText("request", "Запрос в OpenAI не сформирован.", true);
     if (!receivedText) setText("received", "Ответ пока не получен.", true);
     if (!restoredText) setText("restored", "Ответ пока не восстановлен.", true);

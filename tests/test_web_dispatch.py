@@ -124,11 +124,11 @@ def test_dispatch_sends_only_masked_text_and_restores_response(monkeypatch):
 
     assert response.status_code == 200
     body = response.json()
-    expected_raw = "[ПРОМПТ]\nSummarize\n\n[ДОКУМЕНТ]\nAlice Smith lives at 123 Main St"
-    assert pseudonymizer.calls[0] == ("anonymize", expected_raw)
+    assert pseudonymizer.calls[0] == ("anonymize", "Alice Smith lives at 123 Main St")
     assert openai.responses.calls == [{
         "model": "test-model", "instructions": OPENAI_INSTRUCTIONS,
-        "input": "[masked document]", "store": False, "timeout": TIMEOUT_SECONDS,
+        "input": "[ПРОМПТ]\nSummarize\n\n[ДОКУМЕНТ]\n[masked document]",
+        "store": False, "timeout": TIMEOUT_SECONDS,
     }]
     serialized_payload = repr(openai.responses.calls)
     assert "Alice Smith" not in serialized_payload
@@ -209,7 +209,7 @@ def test_local_model_context_limit_is_413_with_counts_guid_and_no_openai_call(mo
     assert body["pipeline_id"] == pipeline_id
     assert body["error"] == {
         "stage": "anonymize", "code": "local_model_context_exceeded",
-        "message": "Документ и промпт превышают контекст локальной модели: 45123 токенов "
+        "message": "Документ и служебные данные не помещаются в контекст локальной модели: 45123 токенов "
                    "при лимите ввода 40704 (окно контекста 40960). Запрос в OpenAI не отправлен.",
         "input_tokens": 45_123, "maximum_input_tokens": 40_704, "context_window": 40_960,
     }

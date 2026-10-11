@@ -57,15 +57,19 @@ def _finite_choices(payload: Any) -> list[dict[str, Any]] | None:
     """Return the only permitted JSON outputs for production choice payloads."""
     if not isinstance(payload, dict):
         return None
-    key = "allowed_relations" if "allowed_relations" in payload else (
-        "allowed_forms" if "allowed_forms" in payload else None
-    )
+    key = next((name for name in (
+        "allowed_assignments", "allowed_relations", "allowed_forms"
+    ) if name in payload), None)
     if key is None:
         return None
     values = payload[key]
     if not isinstance(values, list) or not values or any(not isinstance(v, str) for v in values):
         raise GenerationError(f"{key} must be a non-empty list of strings")
-    output_key = "relation" if key == "allowed_relations" else "form"
+    output_key = {
+        "allowed_assignments": "assignment",
+        "allowed_relations": "relation",
+        "allowed_forms": "form",
+    }[key]
     choices = [{output_key: value} for value in dict.fromkeys(values)]
     if key == "allowed_forms":
         choices.append({"form": None})
@@ -165,8 +169,8 @@ class QwenGenerator:
     def _event(self, stage: str, data: dict[str, Any]) -> None:
         event(stage, {"model": self.model_id, "revision": self.model_revision, **data})
 
-    def choose(self, system: str, payload: Any) -> dict[str, Any]:
-        """Return a parsed JSON object; never accept prose or invented names."""
+    def _prepare_input(self, system: str, payload: Any):
+        """Render and encode the exact input used by both preflight and generation."""
         self._event("llm.input", {
             "system": system,
             "payload": payload,
@@ -241,6 +245,21 @@ class QwenGenerator:
                 "rendered_prompt": rendered,
             })
             raise ContextLimitError(input_tokens, self.input_budget, self.context_window)
+        return rendered, encoded, input_tokens
+
+    def check_input(self, system: str, payload: Any) -> int:
+        """Validate a full prompt against the exact model input budget without generation."""
+        _, _, input_tokens = self._prepare_input(system, payload)
+        self._event("llm.preflight", {
+            "input_tokens": input_tokens,
+            "context_window": self.context_window,
+            "input_budget": self.input_budget,
+        })
+        return input_tokens
+
+    def choose(self, system: str, payload: Any) -> dict[str, Any]:
+        """Return a parsed JSON object; never accept prose or invented names."""
+        rendered, encoded, input_tokens = self._prepare_input(system, payload)
 
         model_inputs = {key: value.to(self.device) for key, value in encoded.items()}
         try:
@@ -262,7 +281,7 @@ class QwenGenerator:
                     logits_to_keep=1,
                     **generation_options,
                 )
-            completion_ids = output[0, input_ids.shape[-1] :]
+            completion_ids = output[0, encoded["input_ids"].shape[-1] :]
             completion = self.tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         except Exception as exc:
             self._event("llm.error", {"type": type(exc).__name__, "phase": "generation",

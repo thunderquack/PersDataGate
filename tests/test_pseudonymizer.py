@@ -78,6 +78,50 @@ def test_repeated_unicode_values_share_marker_and_restore_once():
     assert len(warnings) == 1
 
 
+def test_inline_qwen_mention_ids_never_leak_into_anonymized_api_text(monkeypatch):
+    from pseudonymizer.persons import PersonPipeline
+    from pseudonymizer.service import Span
+
+    monkeypatch.setenv("DEVICE", "cpu")
+    source = "ÉvaÉva"
+
+    class AdjacentUnicodeDetector:
+        def predict_entities(self, text, labels, threshold):
+            return [
+                {"text": "Éva", "label": "person name", "start": 0, "end": 3, "score": 0.99},
+                {"text": "Éva", "label": "person name", "start": 3, "end": 6, "score": 0.99},
+            ]
+
+    class SamePersonGenerator:
+        def __init__(self):
+            self.payloads = []
+
+        def check_input(self, system, payload):
+            self.payloads.append(payload)
+            return 10
+
+        def choose(self, system, payload):
+            self.payloads.append(payload)
+            return {"same_person_ids": ["m2"]}
+
+    generator = SamePersonGenerator()
+    with TestClient(create_app(
+        detector=AdjacentUnicodeDetector(), pipeline=PersonPipeline(generator)
+    )) as client:
+        response = client.post("/anonymize", json={"text": source})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["text"] == "⟦PERSON_1⟧⟦PERSON_1⟧"
+    assert body["text"].count("⟦m") == 0
+    assert "⟦m1⟧" not in response.text and "⟦m2⟧" not in response.text
+    assert "Éva" not in response.text
+    assert generator.payloads[0]["document"] == "⟦m1⟧ Éva⟦m2⟧ Éva"
+    rows = generator.payloads[0]["mentions"]
+    assert [(row["start"], row["end"], row["source_start"], row["source_end"])
+            for row in rows] == [(5, 8, 0, 3), (13, 16, 3, 6)]
+
+
 def test_short_marker_does_not_collide_with_existing_source_marker():
     source = "Literal ⟦PERSON_1⟧; Иван Петров"
     detector = FakeDetector({source: [entity("Иван Петров", "person", source)]})

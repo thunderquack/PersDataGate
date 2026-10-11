@@ -468,8 +468,26 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
                      "end": match.end(), "score": 0.99}
                     for match in re.finditer(r"Alice Example", text)]
 
+    from pseudonymizer.persons import PersonPipeline
+
+    class RecordingLinker:
+        def __init__(self):
+            self.payloads = []
+
+        def check_input(self, system, payload):
+            self.payloads.append(payload)
+            return 20
+
+        def choose(self, system, payload):
+            self.payloads.append(payload)
+            return {"same_person_ids": ["m2"]}
+
+    linker = RecordingLinker()
+
     async def scenario():
-        pseudo_app = create_pseudonymizer_app(detector=PersonDetector())
+        pseudo_app = create_pseudonymizer_app(
+            detector=PersonDetector(), pipeline=PersonPipeline(linker)
+        )
         captured = []
         wire_errors = []
         async with pseudo_app.router.lifespan_context(pseudo_app):
@@ -498,6 +516,7 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
                     assert "Alice Example" not in request_body["input"].split(
                         "[ДОКУМЕНТ]\n", 1
                     )[1]
+                    assert not re.search(r"⟦m\d+⟧", request_body["input"])
                     assert "opaque-map-id" not in request_bytes.decode("utf-8")
                     marker = re.search(r"⟦[^⟦⟧]+⟧", request_body["input"]).group()
                     response_body = {
@@ -529,7 +548,8 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
                     transport=httpx.ASGITransport(app=web_app), base_url="http://web"
                 ) as browser:
                     response = await browser.post("/api/process", json={
-                        "prompt": "Summarize for Alice Example", "document": "Alice Example: alice@example.org",
+                        "prompt": "Summarize for Alice Example",
+                        "document": "Alice ExampleAlice Example: alice@example.org",
                     })
             await sdk_client.close()
             await pseudo_http.aclose()
@@ -554,6 +574,16 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
         "model": wire["model"], "instructions": wire["instructions"],
         "input": wire["input"], "store": False,
     }
+    assert linker.payloads[0]["document"] == (
+        "⟦m1⟧ Alice Example⟦m2⟧ Alice Example: alice@example.org"
+    )
+    assert linker.payloads[0]["mentions"] == [
+        {"id": "m1", "value": "Alice Example", "start": 5, "end": 18,
+         "source_start": 0, "source_end": 13},
+        {"id": "m2", "value": "Alice Example", "start": 23, "end": 36,
+         "source_start": 13, "source_end": 26},
+    ]
+    assert not re.search(r"⟦m\d+⟧", wire["input"])
     assert body["received_text"].startswith("Hello ⟦PERSON_")
     assert body["restored_text"] == "Hello Alice Example"
     pipeline_id = body["pipeline_id"]

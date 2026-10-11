@@ -37,11 +37,36 @@ def person_spans(text, *values):
     return spans
 
 
+def expected_annotated_document(text, spans):
+    parts = []
+    rows = []
+    source_cursor = 0
+    shift = 0
+    for index, span in enumerate(spans, 1):
+        mention_id = f"m{index}"
+        tag = f"⟦{mention_id}⟧ "
+        parts.extend((text[source_cursor:span.start], tag, span.value))
+        annotated_start = span.start + shift + len(tag)
+        rows.append({
+            "id": mention_id,
+            "value": span.value,
+            "start": annotated_start,
+            "end": annotated_start + len(span.value),
+            "source_start": span.start,
+            "source_end": span.end,
+        })
+        shift += len(tag)
+        source_cursor = span.end
+    parts.append(text[source_cursor:])
+    return "".join(parts), rows
+
+
 def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassigned_ids():
     text = ("I. Müller; " + "historischer Kontext. " * 50
             + "Elisabeth Müller; Élisabeth Müller; Mrs Example")
     spans = person_spans(text, "I. Müller", "Elisabeth Müller", "Élisabeth Müller", "Mrs Example")
     generator = ScriptedGenerator(selections=[["m2"], []])
+    annotated_text, expected_mentions = expected_annotated_document(text, spans)
 
     records, warnings = PersonPipeline(generator).link(text, spans)
 
@@ -51,13 +76,12 @@ def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassi
     for system, payload in generator.calls:
         assert "person" in system.lower()
         assert payload["task"] == "link_person_mentions"
-        assert payload["document"] == text
-        assert payload["mentions"] == [
-            {"id": f"m{index}", "value": span.value,
-             "start": span.start, "end": span.end}
-            for index, span in enumerate(spans, 1)
-        ]
-        assert all(text[row["start"]:row["end"]] == row["value"]
+        assert payload["document"] == annotated_text
+        assert payload["document_annotation"]
+        assert payload["mentions"] == expected_mentions
+        assert all(payload["document"][row["start"]:row["end"]] == row["value"]
+                   for row in payload["mentions"])
+        assert all(text[row["source_start"]:row["source_end"]] == row["value"]
                    for row in payload["mentions"])
         assert payload["remaining_candidates"] == [
             row for row in payload["mentions"]
@@ -66,6 +90,7 @@ def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassi
     first, second = [payload for _, payload in generator.calls]
     preflight_payload = generator.preflight_calls[0][1]
     assert preflight_payload == first
+    assert preflight_payload["document"] == annotated_text
     assert first["anchor_id"] == "m1"
     assert first["anchor"] == first["mentions"][0]
     assert first["allowed_same_person_ids"] == ["m2", "m3", "m4"]
@@ -80,6 +105,31 @@ def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassi
     assert len({record.identifier for record in records.values()}) == 3
     assert records[spans[0].start].identifier == records[spans[1].start].identifier
     assert records[spans[2].start].identifier != records[spans[0].start].identifier
+
+
+def test_inline_ids_bind_repeated_adjacent_unicode_occurrences_without_changing_source_offsets():
+    text = "ÉvaÉva"
+    spans = person_spans(text, "Éva", "Éva")
+    generator = ScriptedGenerator(selections=[["m2"]])
+
+    records, warnings = PersonPipeline(generator).link(text, spans)
+
+    assert warnings == []
+    _, payload = generator.calls[0]
+    assert payload["document"] == "⟦m1⟧ Éva⟦m2⟧ Éva"
+    assert payload["mentions"] == [
+        {"id": "m1", "value": "Éva", "start": 5, "end": 8,
+         "source_start": 0, "source_end": 3},
+        {"id": "m2", "value": "Éva", "start": 13, "end": 16,
+         "source_start": 3, "source_end": 6},
+    ]
+    assert [payload["document"][row["start"]:row["end"]] for row in payload["mentions"]] == [
+        "Éva", "Éva",
+    ]
+    assert [text[row["source_start"]:row["source_end"]] for row in payload["mentions"]] == [
+        "Éva", "Éva",
+    ]
+    assert records[0].identifier == records[3].identifier
 
 
 def test_each_anchor_call_is_bounded_by_mentions_and_uncertain_choices_remain_singletons():
@@ -103,6 +153,14 @@ def test_each_anchor_call_is_bounded_by_mentions_and_uncertain_choices_remain_si
         assert payload["allowed_same_person_ids"] == [
             f"m{candidate}" for candidate in range(index + 2, len(spans) + 1)
         ]
+    rows = payloads[0]["mentions"]
+    for index in (8, 9):  # m9 -> m10 changes tag length; later offsets include that shift.
+        row = rows[index]
+        inserted_prefix_length = sum(len(f"⟦m{tag_index}⟧ ")
+                                     for tag_index in range(1, index + 2))
+        assert row["start"] == row["source_start"] + inserted_prefix_length
+        assert row["end"] == row["start"] + len(row["value"])
+        assert payloads[0]["document"][row["start"]:row["end"]] == row["value"]
 
 
 def test_repeated_spellings_can_be_separate_and_name_similarity_does_not_override_model():
@@ -169,12 +227,13 @@ def test_zero_or_one_person_preflights_complete_input_and_skips_generation(perso
 
     assert warnings == []
     assert len(generator.preflight_calls) == 1
-    assert generator.preflight_calls[0][1]["document"] == text
-    assert generator.preflight_calls[0][1]["mentions"] == [
-        {"id": f"m{index}", "value": span.value,
-         "start": span.start, "end": span.end}
-        for index, span in enumerate(spans, 1)
-    ]
+    annotated_text, expected_mentions = expected_annotated_document(text, spans)
+    assert generator.preflight_calls[0][1]["document"] == annotated_text
+    assert generator.preflight_calls[0][1]["mentions"] == expected_mentions
+    assert all(annotated_text[row["start"]:row["end"]] == row["value"]
+               for row in expected_mentions)
+    assert all(text[row["source_start"]:row["source_end"]] == row["value"]
+               for row in expected_mentions)
     assert generator.calls == []
     if spans:
         assert records[spans[0].start].canonical == spans[0].value

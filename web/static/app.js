@@ -69,6 +69,9 @@ function showSteps(result) {
   showRows("entities", steps.entities?.map((row) => ({...row, source: sources[row.source] || row.source})), [
     ["value", "Найденный текст"], ["code", "Тип"], ["source", "Источник"], ["start", "Начало"], ["end", "Конец"],
   ], "Персональные данные не найдены.", "Сервер не передал сведения о распознанных данных.");
+  showRows("person-preparation", steps.person_preparation, [
+    ["id", "ID"], ["canonical", "Имя"], ["aliases", "Варианты"], ["occurrence_count", "Вхождения"],
+  ], "Повторяющиеся упоминания не найдены.", "Сервер не передал результат объединения повторяющихся упоминаний.");
   showRows("persons", steps.persons, [
     ["marker", "Маркер"], ["canonical", "Связанное имя"], ["aliases", "Варианты упоминания"],
   ], "Упоминания людей не найдены.", "Сервер не передал результат связывания упоминаний.");
@@ -83,6 +86,7 @@ function showSteps(result) {
 
 function clearSteps() {
   showRows("entities", null, [], "", "Ожидание данных этапа.");
+  showRows("person-preparation", null, [], "", "Ожидание данных этапа.");
   showRows("persons", null, [], "", "Ожидание данных этапа.");
   showRows("restorations", null, [], "", "Ожидание данных этапа.");
   setText("prepared", "Ожидание данных этапа.", true);

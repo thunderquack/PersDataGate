@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from common.pipeline_log import event
+from .persons import PersonRecord, prepare_person_mentions
 
 CHUNK_SIZE = 700
 CHUNK_OVERLAP = 120
@@ -391,7 +392,25 @@ def find_spans(text: str, model: Any) -> list[Span]:
 def anonymize_text(text: str, model: Any, pipeline: Any | None = None, *,
                    steps: dict[str, Any] | None = None) -> tuple[str, PseudonymMapping]:
     spans = find_spans(text, model)
+    person_preparation = prepare_person_mentions(spans)
     if steps is not None:
+        steps["person_preparation"] = [
+            {
+                "id": row["id"],
+                "canonical": max(
+                    (occurrence["value"] for occurrence in row["occurrences"]),
+                    key=len,
+                ),
+                "aliases": list(row["observed_values"]),
+                "occurrence_count": len(row["occurrences"]),
+                "source_offsets": [
+                    {"start": occurrence["source_start"],
+                     "end": occurrence["source_end"]}
+                    for occurrence in row["occurrences"]
+                ],
+            }
+            for row in person_preparation
+        ]
         steps["entities"] = [
             {
                 "start": span.start,
@@ -420,6 +439,25 @@ def anonymize_text(text: str, model: Any, pipeline: Any | None = None, *,
     person_spans = [span for span in spans if span.code == "PERSON"]
     pipeline_generator = getattr(pipeline, "generator", None)
     has_context_preflight = callable(getattr(pipeline_generator, "check_input", None))
+    if pipeline is None:
+        # Keep the deterministic preparation stage as the fallback grouping
+        # policy too, so the UI trace and emitted markers describe the same
+        # case/edge-whitespace groups when the local model is unavailable.
+        for row in person_preparation:
+            occurrences = row["occurrences"]
+            canonical = max(
+                (occurrence["value"] for occurrence in occurrences),
+                key=len,
+            )
+            record = PersonRecord(
+                identifier=f"person_{uuid.uuid4().hex}",
+                canonical=canonical,
+                aliases=tuple(dict.fromkeys(
+                    occurrence["value"] for occurrence in occurrences
+                )),
+            )
+            for occurrence in occurrences:
+                assignments[occurrence["source_start"]] = record
     if pipeline is not None and (person_spans or has_context_preflight):
         linked, warnings = pipeline.link(text, person_spans)
         if set(linked) != {span.start for span in person_spans}:

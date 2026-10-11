@@ -78,6 +78,34 @@ def test_repeated_unicode_values_share_marker_and_restore_once():
     assert len(warnings) == 1
 
 
+def test_pipeline_free_person_fallback_uses_trim_casefold_and_longest_original_value():
+    source = " ÄNNA ; änna"
+    first_start = 0
+    second_start = source.index("änna")
+    detector = FakeDetector({source: [
+        {"text": " ÄNNA ", "label": "person name", "start": first_start,
+         "end": first_start + len(" ÄNNA "), "score": 0.9},
+        {"text": "änna", "label": "person name", "start": second_start,
+         "end": second_start + len("änna"), "score": 0.9},
+    ]})
+    steps = {}
+
+    masked, mapping = anonymize_text(source, detector, steps=steps)
+
+    marker = "⟦PERSON_1⟧"
+    assert masked == f"{marker}; {marker}"
+    assert mapping == {marker: " ÄNNA "}
+    assert steps["person_preparation"] == [{
+        "id": "m1", "canonical": " ÄNNA ", "aliases": [" ÄNNA ", "änna"],
+        "occurrence_count": 2,
+        "source_offsets": [
+            {"start": 0, "end": 6},
+            {"start": second_start, "end": second_start + 4},
+        ],
+    }]
+    assert "⟦m1⟧" not in masked
+
+
 def test_inline_qwen_mention_ids_never_leak_into_anonymized_api_text(monkeypatch):
     from pseudonymizer.persons import PersonPipeline
     from pseudonymizer.service import Span
@@ -102,7 +130,7 @@ def test_inline_qwen_mention_ids_never_leak_into_anonymized_api_text(monkeypatch
 
         def choose(self, system, payload):
             self.payloads.append(payload)
-        return {"same_person_ids": []}
+            return {"same_person_ids": []}
 
     generator = SamePersonGenerator()
     with TestClient(create_app(

@@ -211,11 +211,13 @@ def test_trim_and_unicode_casefold_pregroup_but_internal_space_nfc_and_initials_
     assert payload["mentions"][0]["observed_values"] == [" ÄNNA ", "änna"]
     assert payload["mentions"][1]["observed_values"] == ["Straße", "STRASSE"]
     assert payload["mentions"][2]["observed_values"] == [" ИВАН ", "иван"]
+    assert records[spans[0].start].canonical == " ÄNNA "
+    assert records[spans[2].start].canonical == "STRASSE"
 
 
 def test_model_selection_of_one_unique_id_maps_all_of_its_exact_occurrences():
-    text = "John Smith; John Smith; Johnny Smith"
-    spans = person_spans(text, "John Smith", "John Smith", "Johnny Smith")
+    text = "John Smith; JOHN SMITH; Johnny Smith"
+    spans = person_spans(text, "John Smith", "JOHN SMITH", "Johnny Smith")
     generator = ScriptedGenerator(selections=[["m2"]])
 
     records, warnings = PersonPipeline(generator).link(text, spans)
@@ -226,13 +228,15 @@ def test_model_selection_of_one_unique_id_maps_all_of_its_exact_occurrences():
     assert [row["id"] for row in payload["mentions"]] == ["m1", "m2"]
     assert payload["allowed_same_person_ids"] == ["m2"]
     assert payload["remaining_candidates"] == [payload["mentions"][1]]
-    assert payload["mentions"][0]["observed_values"] == ["John Smith"]
+    assert payload["mentions"][0]["observed_values"] == ["John Smith", "JOHN SMITH"]
     assert payload["mentions"][0]["occurrences"] == [
         {"value": "John Smith", "start": 5, "end": 15, "source_start": 0, "source_end": 10},
         {"value": "JOHN SMITH", "start": 22, "end": 32, "source_start": 12, "source_end": 22},
     ]
     assert set(records) == {0, 12, 24}
     assert len({record.identifier for record in records.values()}) == 1
+    assert {record.canonical for record in records.values()} == {"Johnny Smith"}
+    assert set(records[0].aliases) == {"John Smith", "JOHN SMITH", "Johnny Smith"}
 
 
 def test_each_anchor_call_is_bounded_by_mentions_and_uncertain_choices_remain_singletons():

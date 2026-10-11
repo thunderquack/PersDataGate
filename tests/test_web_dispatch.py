@@ -592,6 +592,13 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
     ]
     assert linker.payloads[0]["allowed_same_person_ids"] == ["m2"]
     assert linker.payloads[0]["remaining_candidates"] == [linker.payloads[0]["mentions"][1]]
+    assert body["steps"]["person_preparation"] == [
+        {"id": "m1", "canonical": "Alice Example", "aliases": ["Alice Example"],
+         "occurrence_count": 2,
+         "source_offsets": [{"start": 0, "end": 13}, {"start": 13, "end": 26}]},
+        {"id": "m2", "canonical": "Bob Example", "aliases": ["Bob Example"],
+         "occurrence_count": 1, "source_offsets": [{"start": 28, "end": 39}]},
+    ]
     assert not re.search(r"⟦m\d+⟧", wire["input"])
     assert body["received_text"].startswith("Hello ⟦PERSON_")
     assert body["restored_text"] == "Hello Alice Example"
@@ -608,3 +615,35 @@ def test_real_http_and_openai_sdk_pipeline_stays_pseudonymized(monkeypatch):
     assert "alice@example.org" in records_text
     assert "synthetic-test-key" not in records_text
     assert pipeline_id not in json.dumps(wire)
+
+
+def test_ui_stage_headings_include_person_preparation_and_keep_order_1_to_8():
+    html = (Path(__file__).resolve().parents[1] / "web" / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (Path(__file__).resolve().parents[1] / "web" / "static" / "app.js").read_text(encoding="utf-8")
+
+    numbered_headings = re.findall(r"(?:<summary>|<h2>)([1-8])\.", html)
+    assert numbered_headings == [str(index) for index in range(1, 9)]
+    assert "2. Объединение повторяющихся упоминаний" in html
+    assert 'showRows("person-preparation", steps.person_preparation' in app_js
+    assert '["id", "ID"]' in app_js
+
+
+def test_index_busts_app_js_cache_with_current_content_hash_and_disables_html_cache():
+    import hashlib
+
+    static_dir = Path(__file__).resolve().parents[1] / "web" / "static"
+    app_js = (static_dir / "app.js").read_bytes()
+    version = hashlib.sha256(app_js).hexdigest()[:16]
+    script_url = f"/static/app.js?v={version}"
+
+    with TestClient(create_app(
+        pseudonymizer=FakePseudonymizer(), openai_client=FakeOpenAI()
+    )) as client:
+        response = client.get("/")
+        script_response = client.get(script_url)
+
+    assert response.status_code == 200
+    assert script_url in response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert script_response.status_code == 200
+    assert hashlib.sha256(script_response.content).hexdigest()[:16] == version

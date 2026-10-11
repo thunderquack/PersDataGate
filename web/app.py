@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -107,8 +108,14 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
-        with open(os.path.join(os.path.dirname(__file__), "static", "index.html"), encoding="utf-8") as page:
-            return page.read()
+        static_dir = os.path.join(os.path.dirname(__file__), "static")
+        with open(os.path.join(static_dir, "index.html"), encoding="utf-8") as page:
+            html = page.read()
+        with open(os.path.join(static_dir, "app.js"), "rb") as script:
+            app_js = script.read()
+        version = hashlib.sha256(app_js).hexdigest()[:16]
+        html = html.replace('/static/app.js', f'/static/app.js?v={version}')
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
     @app.get("/health")
     async def health():

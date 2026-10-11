@@ -23,6 +23,42 @@ class PersonRecord:
     aliases: tuple[str, ...]
 
 
+def prepare_person_mentions(spans: list[Any]) -> list[dict[str, Any]]:
+    """Group PERSON spans by edge-trimmed Unicode casefold for trace/UI preparation."""
+    mentions = sorted(
+        (span for span in spans if getattr(span, "code", None) == "PERSON"),
+        key=lambda item: (item.start, item.end),
+    )
+    rows_by_value: dict[str, dict[str, Any]] = {}
+    mention_rows: list[dict[str, Any]] = []
+    for span in mentions:
+        grouping_key = span.value.strip().casefold()
+        row = rows_by_value.get(grouping_key)
+        if row is None:
+            row = {
+                "id": f"m{len(mention_rows) + 1}",
+                "value": span.value,
+                "start": span.start,
+                "end": span.end,
+                "source_start": span.start,
+                "source_end": span.end,
+                "observed_values": [],
+                "occurrences": [],
+            }
+            rows_by_value[grouping_key] = row
+            mention_rows.append(row)
+        if span.value not in row["observed_values"]:
+            row["observed_values"].append(span.value)
+        row["occurrences"].append({
+            "value": span.value,
+            "start": span.start,
+            "end": span.end,
+            "source_start": span.start,
+            "source_end": span.end,
+        })
+    return mention_rows
+
+
 _SYSTEM_LINK = (
     "For the anchor person mention, identify which of the allowed remaining mentions "
     "refer to the same individual. In document, ⟦mN⟧ tags are model-only annotations "
@@ -54,37 +90,8 @@ class PersonPipeline:
         self.generator = generator
 
     def link(self, text: str, spans: list[Any]) -> tuple[dict[int, PersonRecord], list[str]]:
-        mentions = sorted(
-            (span for span in spans if getattr(span, "code", None) == "PERSON"),
-            key=lambda item: (item.start, item.end),
-        )
-        rows_by_value: dict[str, dict[str, Any]] = {}
-        mention_rows: list[dict[str, Any]] = []
-        for span in mentions:
-            grouping_key = span.value.strip().casefold()
-            row = rows_by_value.get(grouping_key)
-            if row is None:
-                row = {
-                    "id": f"m{len(mention_rows) + 1}",
-                    "value": span.value,
-                    "start": span.start,
-                    "end": span.end,
-                    "source_start": span.start,
-                    "source_end": span.end,
-                    "observed_values": [],
-                    "occurrences": [],
-                }
-                rows_by_value[grouping_key] = row
-                mention_rows.append(row)
-            if span.value not in row["observed_values"]:
-                row["observed_values"].append(span.value)
-            row["occurrences"].append({
-                "value": span.value,
-                "start": span.start,
-                "end": span.end,
-                "source_start": span.start,
-                "source_end": span.end,
-            })
+        mention_rows = prepare_person_mentions(spans)
+        occurrence_count = sum(len(row["occurrences"]) for row in mention_rows)
         annotated_document = self._annotate_document(text, mention_rows)
         rows_by_id = {row["id"]: row for row in mention_rows}
         pending = [row["id"] for row in mention_rows]
@@ -123,7 +130,7 @@ class PersonPipeline:
                 preflight_tokens = checker(_SYSTEM_LINK, preflight_payload)
             event("person.group_input", {
                 "mentions": mention_rows,
-                "occurrence_count": len(mentions),
+                "occurrence_count": occurrence_count,
                 "unique_mention_count": len(mention_rows),
                 "preflight_tokens": preflight_tokens,
             })
@@ -202,7 +209,7 @@ class PersonPipeline:
         finally:
             event("person.group_summary", {
                 "status": status,
-                "occurrence_count": len(mentions),
+                "occurrence_count": occurrence_count,
                 "unique_mention_count": len(mention_rows),
                 "generation_calls": generation_calls,
                 "preflight_tokens": preflight_tokens,

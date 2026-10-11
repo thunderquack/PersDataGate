@@ -95,7 +95,6 @@ class PersonPipeline:
                     continue
 
                 payload = request_payload(anchor_id, allowed_ids)
-                input_tokens = checker(_SYSTEM_LINK, payload) if callable(checker) else None
                 generation_calls += 1
                 try:
                     result = self.generator.choose(_SYSTEM_LINK, payload)
@@ -119,7 +118,6 @@ class PersonPipeline:
                     "model_result": result,
                     "same_person_ids": same_ids,
                     "group_ids": group_ids,
-                    "input_tokens": input_tokens,
                 })
 
             records_by_start: dict[int, PersonRecord] = {}

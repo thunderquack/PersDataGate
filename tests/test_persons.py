@@ -46,7 +46,7 @@ def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassi
     records, warnings = PersonPipeline(generator).link(text, spans)
 
     assert warnings == []
-    assert len(generator.preflight_calls) == 1
+    assert len(generator.preflight_calls) == len(generator.calls) + 1
     assert len(generator.calls) == 2
     for system, payload in generator.calls:
         assert "person" in system.lower()
@@ -60,6 +60,10 @@ def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassi
         assert all(text[row["start"]:row["end"]] == row["value"]
                    for row in payload["mentions"])
     first, second = [payload for _, payload in generator.calls]
+    preflight_payloads = [payload for _, payload in generator.preflight_calls]
+    assert preflight_payloads == [first, first, second]
+    assert preflight_payloads[0]["anchor_id"] == "m1"
+    assert preflight_payloads[0]["allowed_same_person_ids"] == ["m2", "m3", "m4"]
     assert first["anchor_id"] == "m1"
     assert first["anchor"] == first["mentions"][0]
     assert first["allowed_same_person_ids"] == ["m2", "m3", "m4"]
@@ -132,7 +136,7 @@ def test_bad_anchor_choice_raises_safe_grouping_error(response):
 
     with pytest.raises(PersonGroupingError):
         PersonPipeline(generator).link(text, spans)
-    assert len(generator.preflight_calls) == 1
+    assert len(generator.preflight_calls) == len(generator.calls) + 1
     assert len(generator.calls) == 1
 
 
@@ -157,7 +161,7 @@ def test_zero_or_one_person_preflights_complete_input_and_skips_generation(perso
     records, warnings = PersonPipeline(generator).link(text, spans)
 
     assert warnings == []
-    assert len(generator.preflight_calls) == 1
+    assert len(generator.preflight_calls) == len(generator.calls) + 1
     assert generator.preflight_calls[0][1]["document"] == text
     assert generator.preflight_calls[0][1]["mentions"] == [
         {"id": f"m{index}", "value": span.value,

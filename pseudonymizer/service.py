@@ -95,6 +95,11 @@ LABEL_CODES = {
 _ADDRESS_CONTEXT = re.compile(r"(?i)\b(?:по\s+адресу|адрес(?:а|е|у)?|wohnhaft\s+in|adresse|address)\s*:?\s*")
 _CITY_PREFIX = re.compile(r"(?i)(?:г\.?\s+[A-ZА-ЯЁ][\w-]*,\s*)$")
 _POSTCODE_CITY_SUFFIX = re.compile(r"(?i)(?:,\s*|\s+)\d{5}\s+[A-ZÄÖÜ][\wÄÖÜäöüß-]*")
+_GERMAN_HONORIFIC_PERSON = re.compile(
+    r"(?<![\w])(?:Herrn|Herr|Frau)[ \t]+"
+    r"(?P<surname>[^\W\d_]+(?:[-’'][^\W\d_]+)*)(?![\w’'-])"
+)
+_GERMAN_NON_NAME_TITLES = {"dr", "prof", "professor", "dipl", "med"}
 
 
 @dataclass(frozen=True)
@@ -292,6 +297,7 @@ def find_spans(text: str, model: Any) -> list[Span]:
             "returned_entities": logged_predictions,
             "rejected_low_confidence": rejected_low_confidence,
         })
+    existing_person_spans = [span for span in spans if span.code == "PERSON"]
     rule_detections: list[dict[str, Any]] = []
     for code, pattern in PATTERNS:
         for match in pattern.finditer(text):
@@ -326,6 +332,25 @@ def find_spans(text: str, model: Any) -> list[Span]:
             spans.append(Span(start, end, value, code, 1.0, True))
             rule_detections.append({"code": code, "start": start, "end": end,
                                     "value": value, "accepted": True})
+    honorific_detections: list[dict[str, Any]] = []
+    for match in _GERMAN_HONORIFIC_PERSON.finditer(text):
+        surname = match.group("surname")
+        if not surname[0].isupper() or surname.casefold() in _GERMAN_NON_NAME_TITLES:
+            continue
+        start, end = match.span()
+        if any(start < person.end and person.start < end for person in existing_person_spans):
+            honorific_detections.append({
+                "code": "PERSON", "start": start, "end": end,
+                "value": text[start:end], "accepted": False,
+                "reason": "overlaps_existing_person",
+            })
+            continue
+        spans.append(Span(start, end, text[start:end], "PERSON", 1.0, True))
+        honorific_detections.append({
+            "code": "PERSON", "start": start, "end": end,
+            "value": text[start:end], "accepted": True,
+        })
+    rule_detections.extend(honorific_detections)
     event("ner.rules", {"detections": rule_detections})
 
     # Deduplicate overlapping-window matches, then resolve overlap by rule,

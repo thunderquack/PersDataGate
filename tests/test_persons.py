@@ -80,6 +80,15 @@ def test_groups_incrementally_with_complete_exact_offset_context_and_canonical_n
         text[row["start"]:row["end"]] == row["value"]
         for _, payload in generator.calls for row in payload["mentions"]
     )
+    for payload in assignments:
+        mentions = {row["id"]: row for row in payload["mentions"]}
+        current = payload["current_mention"]
+        assert current == mentions[payload["current_mention_id"]]
+        assert text[current["start"]:current["end"]] == current["value"]
+        for group in payload["groups"]:
+            assert group["member_mentions"] == [mentions[item] for item in group["member_ids"]]
+            assert all(text[row["start"]:row["end"]] == row["value"]
+                       for row in group["member_mentions"])
     assert len({record.identifier for record in records.values()}) == 1
     assert {record.canonical for record in records.values()} == {"Elisabeth Müller"}
     assert set(next(iter(records.values())).aliases) == {
@@ -112,13 +121,23 @@ def test_ambiguous_assignment_is_retried_once_after_other_groups_are_known():
     assert [payload["task"] for payload in retry] == ["assign_person", "retry_person"]
     assert retry[0]["allowed_assignments"] == ["entity_1", "new", "unknown"]
     assert retry[1]["allowed_assignments"] == ["entity_1", "entity_2", "new", "unknown"]
-    assert retry[0]["groups"] == [
-        {"id": "entity_1", "member_ids": ["m1"], "values": ["Alexander Smith"]},
-    ]
-    assert retry[1]["groups"] == [
-        {"id": "entity_1", "member_ids": ["m1"], "values": ["Alexander Smith"]},
-        {"id": "entity_2", "member_ids": ["m3"], "values": ["Bo Li"]},
-    ]
+    assert retry[0]["groups"] == [{
+        "id": "entity_1", "member_ids": ["m1"], "values": ["Alexander Smith"],
+        "member_mentions": [retry[0]["mentions"][0]],
+    }]
+    assert retry[1]["groups"] == [{
+        "id": "entity_1", "member_ids": ["m1"], "values": ["Alexander Smith"],
+        "member_mentions": [retry[1]["mentions"][0]],
+    }, {
+        "id": "entity_2", "member_ids": ["m3"], "values": ["Bo Li"],
+        "member_mentions": [retry[1]["mentions"][2]],
+    }]
+    for payload in retry:
+        mention_rows = {row["id"]: row for row in payload["mentions"]}
+        assert payload["current_mention"] == mention_rows[payload["current_mention_id"]]
+        assert text[payload["current_mention"]["start"]:payload["current_mention"]["end"]] == payload["current_mention"]["value"]
+        for group in payload["groups"]:
+            assert group["member_mentions"] == [mention_rows[item] for item in group["member_ids"]]
     by_value = records_by_value(spans, records)
     assert by_value["Alice Smith"].identifier == by_value["Alexander Smith"].identifier
     assert by_value["Bo Li"].identifier != by_value["Alexander Smith"].identifier
@@ -163,6 +182,17 @@ def test_final_validation_splits_a_conflicting_member_from_immutable_group_snaps
     # Both checks see the same immutable pre-split group membership.
     assert all(payload["groups"][0]["member_ids"] == ["m1", "m2", "m3"]
                for payload in validations)
+    for payload in validations:
+        mention_rows = {row["id"]: row for row in payload["mentions"]}
+        assert payload["group_id"] == "entity_1"
+        assert payload["target_mention"] == mention_rows[payload["target_mention_id"]]
+        assert payload["other_mentions"] == [mention_rows[item] for item in payload["other_member_ids"]]
+        assert payload["groups"][0]["member_mentions"] == [
+            mention_rows[item] for item in payload["groups"][0]["member_ids"]
+        ]
+        assert text[payload["target_mention"]["start"]:payload["target_mention"]["end"]] == payload["target_mention"]["value"]
+        assert all(text[row["start"]:row["end"]] == row["value"]
+                   for row in payload["other_mentions"])
     by_value = records_by_value(spans, records)
     assert by_value["Alexander Smith"].identifier == by_value["Alex Smith"].identifier
     assert by_value["A. Smith"].identifier != by_value["Alexander Smith"].identifier

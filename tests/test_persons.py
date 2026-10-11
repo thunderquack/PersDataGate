@@ -38,8 +38,9 @@ def person_spans(text, *values):
 
 
 def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassigned_ids():
-    text = "I. Müller; " + "historischer Kontext. " * 50 + "Elisabeth Müller; Élisabeth Müller"
-    spans = person_spans(text, "I. Müller", "Elisabeth Müller", "Élisabeth Müller")
+    text = ("I. Müller; " + "historischer Kontext. " * 50
+            + "Elisabeth Müller; Élisabeth Müller; Mrs Example")
+    spans = person_spans(text, "I. Müller", "Elisabeth Müller", "Élisabeth Müller", "Mrs Example")
     generator = ScriptedGenerator(selections=[["m2"], []])
 
     records, warnings = PersonPipeline(generator).link(text, spans)
@@ -61,11 +62,11 @@ def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassi
     first, second = [payload for _, payload in generator.calls]
     assert first["anchor_id"] == "m1"
     assert first["anchor"] == first["mentions"][0]
-    assert first["allowed_same_person_ids"] == ["m2", "m3"]
+    assert first["allowed_same_person_ids"] == ["m2", "m3", "m4"]
     assert second["anchor_id"] == "m3"
     assert second["anchor"] == second["mentions"][2]
-    assert second["allowed_same_person_ids"] == []
-    assert len({record.identifier for record in records.values()}) == 2
+    assert second["allowed_same_person_ids"] == ["m4"]
+    assert len({record.identifier for record in records.values()}) == 3
     assert records[spans[0].start].identifier == records[spans[1].start].identifier
     assert records[spans[2].start].identifier != records[spans[0].start].identifier
 
@@ -99,7 +100,7 @@ def test_repeated_spellings_can_be_separate_and_name_similarity_does_not_overrid
         text, "John Smith", "John Smith", "Иван Иванович Петров", "Иван Петрович Петров"
     )
     # First pair split; last two joined to the third source-order anchor.
-    generator = ScriptedGenerator(selections=[[], ["m4"], []])
+    generator = ScriptedGenerator(selections=[[], [], ["m4"]])
 
     records, warnings = PersonPipeline(generator).link(text, spans)
 
@@ -133,6 +134,18 @@ def test_bad_anchor_choice_raises_safe_grouping_error(response):
         PersonPipeline(generator).link(text, spans)
     assert len(generator.preflight_calls) == 1
     assert len(generator.calls) == 1
+
+
+def test_already_processed_id_is_rejected_as_unallowed():
+    text = "Alice Example; Bob Example; Casey Example; Drew Example"
+    spans = person_spans(text, "Alice Example", "Bob Example", "Casey Example", "Drew Example")
+    generator = ScriptedGenerator(selections=[["m2"], ["m2"]])
+
+    with pytest.raises(PersonGroupingError):
+        PersonPipeline(generator).link(text, spans)
+    assert len(generator.calls) == 2
+    assert generator.calls[1][1]["anchor_id"] == "m3"
+    assert generator.calls[1][1]["allowed_same_person_ids"] == ["m4"]
 
 
 @pytest.mark.parametrize("person_values", [(), ("Irene Blake",)])

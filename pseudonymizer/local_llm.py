@@ -192,7 +192,7 @@ class QwenGenerator:
             "payload": payload,
             "context_window": self.context_window,
             "input_budget": maximum_input_tokens,
-                "max_new_tokens": output_budget,
+            "max_new_tokens": output_budget,
         })
         if not isinstance(system, str):
             raise GenerationError("Model instructions must be text")
@@ -261,7 +261,7 @@ class QwenGenerator:
                 "maximum_input_tokens": maximum_input_tokens,
                 "context_window": self.context_window,
                 "input_budget": maximum_input_tokens,
-            "max_new_tokens": output_budget,
+                "max_new_tokens": output_budget,
                 "rendered_prompt": rendered,
             })
             raise ContextLimitError(input_tokens, maximum_input_tokens, self.context_window)

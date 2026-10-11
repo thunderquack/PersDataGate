@@ -58,7 +58,6 @@ class PersonPipeline:
         preflight_tokens: int | None = None
         started = time.monotonic()
         status = "error"
-        model_result: dict[str, Any] | None = None
 
         def request_payload(anchor_id: str | None, allowed_ids: list[str]) -> dict[str, Any]:
             return {
@@ -108,7 +107,6 @@ class PersonPipeline:
                     raise PersonGroupingError(
                         "The local model did not return a valid person-link response"
                     ) from exc
-                model_result = result
                 same_ids = self._validate_result(result, allowed_ids)
                 same_set = set(same_ids)
                 group_ids = [anchor_id, *[item for item in allowed_ids if item in same_set]]

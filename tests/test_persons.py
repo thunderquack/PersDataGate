@@ -59,15 +59,24 @@ def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassi
         ]
         assert all(text[row["start"]:row["end"]] == row["value"]
                    for row in payload["mentions"])
+        assert payload["remaining_candidates"] == [
+            row for row in payload["mentions"]
+            if row["id"] in payload["allowed_same_person_ids"]
+        ]
     first, second = [payload for _, payload in generator.calls]
     preflight_payload = generator.preflight_calls[0][1]
     assert preflight_payload == first
     assert first["anchor_id"] == "m1"
     assert first["anchor"] == first["mentions"][0]
     assert first["allowed_same_person_ids"] == ["m2", "m3", "m4"]
+    assert first["previously_processed_ids"] == []
     assert second["anchor_id"] == "m3"
     assert second["anchor"] == second["mentions"][2]
     assert second["allowed_same_person_ids"] == ["m4"]
+    assert second["previously_processed_ids"] == ["m1", "m2"]
+    assert second["remaining_candidates"] == [second["mentions"][3]]
+    # All original mentions remain in the document table; the prior group is context only.
+    assert second["mentions"] == first["mentions"]
     assert len({record.identifier for record in records.values()}) == 3
     assert records[spans[0].start].identifier == records[spans[1].start].identifier
     assert records[spans[2].start].identifier != records[spans[0].start].identifier

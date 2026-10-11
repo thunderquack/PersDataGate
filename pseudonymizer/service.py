@@ -417,14 +417,15 @@ def anonymize_text(text: str, model: Any, pipeline: Any | None = None, *,
                 return marker
 
     assignments: dict[int, Any] = {}
-    if pipeline is not None:
+    pipeline_generator = getattr(pipeline, "generator", None)
+    has_context_preflight = callable(getattr(pipeline_generator, "check_input", None))
+    if pipeline is not None and (person_spans or has_context_preflight):
         person_spans = [span for span in spans if span.code == "PERSON"]
-        if person_spans:
-            linked, warnings = pipeline.link(text, person_spans)
-            if set(linked) != {span.start for span in person_spans}:
-                raise RuntimeError("Incomplete person assignments")
-            assignments = linked
-            mapping.warnings.extend(warnings)
+        linked, warnings = pipeline.link(text, person_spans)
+        if set(linked) != {span.start for span in person_spans}:
+            raise RuntimeError("Incomplete person assignments")
+        assignments = linked
+        mapping.warnings.extend(warnings)
     for span in spans:
         record = assignments.get(span.start) if span.code == "PERSON" else None
         if record is not None:

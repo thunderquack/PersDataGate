@@ -222,6 +222,47 @@ def test_input_exactly_at_model_budget_is_allowed(monkeypatch, tmp_path):
     assert len(calls["generate"]) == 1
 
 
+def test_preflight_uses_exact_rendered_input_at_budget_without_generating(monkeypatch, tmp_path):
+    events = []
+    monkeypatch.setattr("pseudonymizer.local_llm.event", lambda name, data: events.append((name, data)))
+    calls = mocked_transformers(
+        monkeypatch,
+        response='{"assignment":"entity_1"}',
+        input_tokens=4096 - MAX_NEW_TOKENS,
+        model_context=4096,
+    )
+    generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
+    payload = {
+        "document": "Alice Example lives in Berlin.",
+        "mentions": [{"id": "m1", "value": "Alice Example", "start": 0, "end": 13}],
+        "groups": [],
+        "allowed_assignments": ["new", "unknown"],
+    }
+
+    assert generator.check_input("Link the mention", payload) == 4096 - MAX_NEW_TOKENS
+    assert calls["template"][0][0][1]["content"] == json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    )
+    assert calls["generate"] == []
+    assert any(name == "llm.preflight" for name, _ in events)
+
+
+def test_preflight_rejects_one_token_over_without_generation(monkeypatch, tmp_path):
+    calls = mocked_transformers(
+        monkeypatch,
+        response='{"assignment":"new"}',
+        input_tokens=4096 - MAX_NEW_TOKENS + 1,
+        model_context=4096,
+    )
+    generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
+
+    with pytest.raises(ContextLimitError) as error:
+        generator.check_input("Link mentions", {"document": "x" * 50000, "mentions": [], "groups": []})
+    assert error.value.input_tokens == 4096 - MAX_NEW_TOKENS + 1
+    assert error.value.maximum_input_tokens == 4096 - MAX_NEW_TOKENS
+    assert calls["generate"] == []
+
+
 @pytest.mark.parametrize(
     "response",
     [
@@ -253,6 +294,8 @@ def test_returns_json_values_for_caller_semantic_validation(monkeypatch, tmp_pat
     ("payload", "permitted"),
     [
         ({"allowed_relations": ["same", "different"]}, ['{"relation":"same"}', '{"relation":"different"}']),
+        ({"allowed_assignments": ["entity_1", "new", "unknown"]},
+         ['{"assignment":"entity_1"}', '{"assignment":"new"}', '{"assignment":"unknown"}']),
         ({"allowed_forms": ["Ивана Иванова", "Ivanov" ]}, ['{"form":"Ивана Иванова"}', '{"form":"Ivanov"}', '{"form":null}']),
     ],
 )

@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from common.pipeline_log import PipelineLogError, event, install_pipeline_logging
 from .config import get_device
-from .local_llm import ContextLimitError
+from .local_llm import ContextLimitError, PersonGroupingError
 from .service import MAX_TEXT_LENGTH, MappingStore, anonymize_text, expires_iso, restore_text
 
 MAX_RESPONSE_LENGTH = 3_000_000
@@ -246,6 +246,11 @@ def create_app(detector: Any | None = None, store: MappingStore | None = None,
                 "input_tokens": exc.input_tokens,
                 "maximum_input_tokens": exc.maximum_input_tokens,
                 "context_window": exc.context_window,
+            }) from None
+        except PersonGroupingError as exc:
+            event("anonymization.person_grouping_error", {"error_type": type(exc).__name__})
+            raise HTTPException(status_code=503, detail={
+                "code": "person_grouping_failed",
             }) from None
         except Exception as exc:
             event("anonymization.error", {"type": type(exc).__name__})

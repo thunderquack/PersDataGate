@@ -272,6 +272,61 @@ def test_preflight_rejects_one_token_over_without_generation(monkeypatch, tmp_pa
     assert calls["generate"] == []
 
 
+@pytest.mark.parametrize("candidate_count,expected_output_budget", [(0, 256), (20, 384)])
+def test_anchor_linking_reserves_dynamic_output_budget_for_candidate_ids(
+    monkeypatch, tmp_path, candidate_count, expected_output_budget
+):
+    events = []
+    monkeypatch.setattr("pseudonymizer.local_llm.event", lambda name, data: events.append((name, data)))
+    model_context = 4096
+    input_tokens = model_context - expected_output_budget
+    calls = mocked_transformers(
+        monkeypatch, response='{"same_person_ids":[]}', input_tokens=input_tokens,
+        model_context=model_context,
+    )
+    generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
+    payload = {
+        "task": "link_person_mentions",
+        "document": "A long document",
+        "mentions": [],
+        "anchor_id": "m1",
+        "anchor": {"id": "m1", "value": "Alice Example", "start": 0, "end": 13},
+        "allowed_same_person_ids": [f"m{index}" for index in range(2, candidate_count + 2)],
+    }
+
+    assert generator.check_input("Link people", payload) == input_tokens
+    assert calls["generate"] == []
+    assert any(name == "llm.preflight" and data["max_new_tokens"] == expected_output_budget
+               and data["input_budget"] == model_context - expected_output_budget
+               for name, data in events)
+
+    assert generator.choose("Link people", payload) == {"same_person_ids": []}
+    assert calls["generate"][-1]["max_new_tokens"] == expected_output_budget
+
+
+def test_anchor_dynamic_budget_overflow_is_rejected_before_generation(monkeypatch, tmp_path):
+    # Twenty candidates reserve 384 output tokens, reducing the input allowance accordingly.
+    calls = mocked_transformers(
+        monkeypatch, response='{"same_person_ids":[]}', input_tokens=4096 - 384 + 1,
+        model_context=4096,
+    )
+    generator = QwenGenerator(device="cpu", cache_dir=tmp_path)
+    payload = {
+        "task": "link_person_mentions",
+        "document": "A long document",
+        "mentions": [],
+        "anchor_id": "m1",
+        "anchor": {"id": "m1", "value": "Alice Example", "start": 0, "end": 13},
+        "allowed_same_person_ids": [f"m{index}" for index in range(2, 22)],
+    }
+
+    with pytest.raises(ContextLimitError) as error:
+        generator.check_input("Link people", payload)
+    assert error.value.input_tokens == 4096 - 384 + 1
+    assert error.value.maximum_input_tokens == 4096 - 384
+    assert calls["generate"] == []
+
+
 @pytest.mark.parametrize(
     "response",
     [

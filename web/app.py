@@ -163,6 +163,17 @@ def create_app(*, pseudonymizer: Any | None = None, openai_client: Any | None = 
                             "anonymize", "local_model_context_exceeded", message,
                             status_code=413, details=values,
                         ) from None
+            if exc.response.status_code == 503:
+                try:
+                    detail = exc.response.json().get("detail", {})
+                except (ValueError, AttributeError):
+                    detail = {}
+                if isinstance(detail, dict) and detail.get("code") == "person_grouping_failed":
+                    raise ApiError(
+                        "anonymize", "person_grouping_failed",
+                        "Не удалось безопасно сгруппировать упоминания людей. Запрос в OpenAI не отправлен.",
+                        status_code=503,
+                    ) from None
             raise ApiError("anonymize", "pseudonymizer_unavailable",
                            "Не удалось псевдонимизировать текст. Запрос в OpenAI не отправлен.") from None
         except Exception:

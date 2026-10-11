@@ -1,38 +1,30 @@
 from __future__ import annotations
 
-from collections import defaultdict
-
 import pytest
 
+from pseudonymizer.local_llm import PersonGroupingError
 from pseudonymizer.persons import PersonPipeline
 from pseudonymizer.service import Span
 
 
 class ScriptedGenerator:
-    """Return controlled finite choices while recording every group snapshot."""
-
-    def __init__(self, *, assign=None, validate=None, preflight=None):
-        self.assign = assign or (lambda payload: payload["groups"][0]["id"])
-        self.validate = validate or (lambda payload: "same")
-        self.preflight = preflight
+    def __init__(self, selections=None, *, preflight_error=None):
+        self.selections = list(selections or [])
+        self.preflight_error = preflight_error
         self.preflight_calls = []
         self.calls = []
 
     def check_input(self, system, payload):
         self.preflight_calls.append((system, payload))
-        if isinstance(self.preflight, Exception):
-            raise self.preflight
-        return self.preflight if isinstance(self.preflight, int) else 12
+        if self.preflight_error:
+            raise self.preflight_error
+        return 17
 
     def choose(self, system, payload):
         self.calls.append((system, payload))
-        if payload["task"] in {"assign_person", "retry_person"}:
-            assignment = self.assign(payload)
-            return {"assignment": assignment}
-        if payload["task"] == "validate_group_member":
-            relation = self.validate(payload)
-            return {"relation": relation}
-        raise AssertionError(f"Unexpected task: {payload.get('task')}")
+        if self.selections:
+            return {"same_person_ids": self.selections.pop(0)}
+        return {"same_person_ids": []}
 
 
 def person_spans(text, *values):
@@ -45,268 +37,40 @@ def person_spans(text, *values):
     return spans
 
 
-def value_for(payload, mention_id):
-    return next(row["value"] for row in payload["mentions"] if row["id"] == mention_id)
-
-
-def records_by_value(spans, records):
-    return {span.value: records[span.start] for span in spans}
-
-
-def test_groups_incrementally_with_complete_exact_offset_context_and_canonical_name():
+def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassigned_ids():
     text = "I. Müller; " + "historischer Kontext. " * 50 + "Elisabeth Müller; Élisabeth Müller"
     spans = person_spans(text, "I. Müller", "Elisabeth Müller", "Élisabeth Müller")
-    generator = ScriptedGenerator()
+    generator = ScriptedGenerator(selections=[["m2"], []])
 
     records, warnings = PersonPipeline(generator).link(text, spans)
 
     assert warnings == []
     assert len(generator.preflight_calls) == 1
-    assert generator.preflight_calls[0][1]["document"] == text
-    assert [row["value"] for row in generator.preflight_calls[0][1]["mentions"]] == [
-        "I. Müller", "Elisabeth Müller", "Élisabeth Müller",
-    ]
-    assert all(
-        text[row["start"]:row["end"]] == row["value"]
-        for row in generator.preflight_calls[0][1]["mentions"]
-    )
-    assignments = [payload for _, payload in generator.calls
-                   if payload["task"] in {"assign_person", "retry_person"}]
-    assert [value_for(payload, payload["current_mention_id"]) for payload in assignments] == [
-        "Élisabeth Müller", "I. Müller",
-    ]
-    assert all(payload["document"] == text for _, payload in generator.calls)
-    assert all(
-        text[row["start"]:row["end"]] == row["value"]
-        for _, payload in generator.calls for row in payload["mentions"]
-    )
-    for payload in assignments:
-        mentions = {row["id"]: row for row in payload["mentions"]}
-        current = payload["current_mention"]
-        assert current == mentions[payload["current_mention_id"]]
-        assert text[current["start"]:current["end"]] == current["value"]
-        for group in payload["groups"]:
-            assert group["member_mentions"] == [mentions[item] for item in group["member_ids"]]
-            assert all(text[row["start"]:row["end"]] == row["value"]
-                       for row in group["member_mentions"])
-    assert len({record.identifier for record in records.values()}) == 1
-    assert {record.canonical for record in records.values()} == {"Elisabeth Müller"}
-    assert set(next(iter(records.values())).aliases) == {
-        "I. Müller", "Elisabeth Müller", "Élisabeth Müller",
-    }
-
-
-def test_ambiguous_assignment_is_retried_once_after_other_groups_are_known():
-    text = "Alexander Smith; Alice Smith; Bo Li"
-    spans = person_spans(text, "Alexander Smith", "Alice Smith", "Bo Li")
-    calls_by_value = defaultdict(int)
-
-    def assign(payload):
-        value = value_for(payload, payload["current_mention_id"])
-        calls_by_value[value] += 1
-        if value == "Bo Li":
-            return "new"
-        if value == "Alice Smith" and calls_by_value[value] == 1:
-            return "unknown"
-        return "entity_1"
-
-    generator = ScriptedGenerator(assign=assign)
-    records, warnings = PersonPipeline(generator).link(text, spans)
-
-    assignment_calls = [payload for _, payload in generator.calls
-                        if payload["task"] in {"assign_person", "retry_person"}]
-    retry = [payload for payload in assignment_calls
-             if value_for(payload, payload["current_mention_id"]) == "Alice Smith"]
-    assert len(retry) == 2
-    assert [payload["task"] for payload in retry] == ["assign_person", "retry_person"]
-    assert retry[0]["allowed_assignments"] == ["entity_1", "new", "unknown"]
-    assert retry[1]["allowed_assignments"] == ["entity_1", "entity_2", "new", "unknown"]
-    assert retry[0]["groups"] == [{
-        "id": "entity_1", "member_ids": ["m1"], "values": ["Alexander Smith"],
-        "member_mentions": [retry[0]["mentions"][0]],
-    }]
-    assert retry[1]["groups"] == [{
-        "id": "entity_1", "member_ids": ["m1"], "values": ["Alexander Smith"],
-        "member_mentions": [retry[1]["mentions"][0]],
-    }, {
-        "id": "entity_2", "member_ids": ["m3"], "values": ["Bo Li"],
-        "member_mentions": [retry[1]["mentions"][2]],
-    }]
-    for payload in retry:
-        mention_rows = {row["id"]: row for row in payload["mentions"]}
-        assert payload["current_mention"] == mention_rows[payload["current_mention_id"]]
-        assert text[payload["current_mention"]["start"]:payload["current_mention"]["end"]] == payload["current_mention"]["value"]
-        for group in payload["groups"]:
-            assert group["member_mentions"] == [mention_rows[item] for item in group["member_ids"]]
-    by_value = records_by_value(spans, records)
-    assert by_value["Alice Smith"].identifier == by_value["Alexander Smith"].identifier
-    assert by_value["Bo Li"].identifier != by_value["Alexander Smith"].identifier
-    assert warnings == []
-
-
-def test_unresolved_unknown_is_retried_once_then_kept_separate_with_warning():
-    text = "Alexander Smith; A. Smith"
-    spans = person_spans(text, "Alexander Smith", "A. Smith")
-    generator = ScriptedGenerator(assign=lambda payload: "unknown")
-
-    records, warnings = PersonPipeline(generator).link(text, spans)
-
-    assignments = [payload for _, payload in generator.calls
-                   if payload["task"] in {"assign_person", "retry_person"}]
-    assert len(assignments) == 2
-    assert assignments[0]["task"] == "assign_person"
-    assert assignments[1]["task"] == "retry_person"
-    assert value_for(assignments[0], assignments[0]["current_mention_id"]) == "A. Smith"
-    assert value_for(assignments[1], assignments[1]["current_mention_id"]) == "A. Smith"
-    by_value = records_by_value(spans, records)
-    assert by_value["Alexander Smith"].identifier != by_value["A. Smith"].identifier
-    assert warnings
-
-
-def test_final_validation_splits_a_conflicting_member_from_immutable_group_snapshot():
-    text = "Alexander Smith; Alex Smith; A. Smith"
-    spans = person_spans(text, "Alexander Smith", "Alex Smith", "A. Smith")
-
-    def validate(payload):
-        return "different" if value_for(payload, payload["target_mention_id"]) == "A. Smith" else "same"
-
-    generator = ScriptedGenerator(validate=validate)
-    records, warnings = PersonPipeline(generator).link(text, spans)
-
-    validations = [payload for _, payload in generator.calls
-                   if payload["task"] == "validate_group_member"]
-    assert len(validations) == 2
-    assert {tuple(payload["other_member_ids"]) for payload in validations} == {
-        ("m1", "m2"), ("m1", "m3"),
-    }
-    # Both checks see the same immutable pre-split group membership.
-    assert all(payload["groups"][0]["member_ids"] == ["m1", "m2", "m3"]
-               for payload in validations)
-    for payload in validations:
-        mention_rows = {row["id"]: row for row in payload["mentions"]}
-        assert payload["group_id"] == "entity_1"
-        assert payload["target_mention"] == mention_rows[payload["target_mention_id"]]
-        assert payload["other_mentions"] == [mention_rows[item] for item in payload["other_member_ids"]]
-        assert payload["groups"][0]["member_mentions"] == [
-            mention_rows[item] for item in payload["groups"][0]["member_ids"]
+    assert len(generator.calls) == 2
+    for system, payload in generator.calls:
+        assert "person" in system.lower()
+        assert payload["task"] == "link_person_mentions"
+        assert payload["document"] == text
+        assert payload["mentions"] == [
+            {"id": f"m{index}", "value": span.value,
+             "start": span.start, "end": span.end}
+            for index, span in enumerate(spans, 1)
         ]
-        assert text[payload["target_mention"]["start"]:payload["target_mention"]["end"]] == payload["target_mention"]["value"]
         assert all(text[row["start"]:row["end"]] == row["value"]
-                   for row in payload["other_mentions"])
-    by_value = records_by_value(spans, records)
-    assert by_value["Alexander Smith"].identifier == by_value["Alex Smith"].identifier
-    assert by_value["A. Smith"].identifier != by_value["Alexander Smith"].identifier
-    assert warnings
-
-
-def test_repeated_identical_spellings_can_be_assigned_to_distinct_people():
-    text = "John Smith; John Smith"
-    spans = person_spans(text, "John Smith", "John Smith")
-    seen = 0
-
-    def assign(payload):
-        nonlocal seen
-        seen += 1
-        return "new"
-
-    records, _ = PersonPipeline(ScriptedGenerator(assign=assign)).link(text, spans)
-    assert records[spans[0].start].identifier != records[spans[1].start].identifier
-
-
-def test_model_can_link_linguistically_dissimilar_names_without_a_python_name_filter():
-    text = "Иван Иванович Петров; Иван Петрович Петров"
-    spans = person_spans(text, "Иван Иванович Петров", "Иван Петрович Петров")
-    records, warnings = PersonPipeline(ScriptedGenerator()).link(text, spans)
-
+                   for row in payload["mentions"])
+    first, second = [payload for _, payload in generator.calls]
+    assert first["anchor_id"] == "m1"
+    assert first["anchor"] == first["mentions"][0]
+    assert first["allowed_same_person_ids"] == ["m2", "m3"]
+    assert second["anchor_id"] == "m3"
+    assert second["anchor"] == second["mentions"][2]
+    assert second["allowed_same_person_ids"] == []
+    assert len({record.identifier for record in records.values()}) == 2
     assert records[spans[0].start].identifier == records[spans[1].start].identifier
-    assert warnings == []
+    assert records[spans[2].start].identifier != records[spans[0].start].identifier
 
 
-@pytest.mark.parametrize("relation", ["different", "unknown"])
-def test_group_validation_splits_non_same_member_outcome(relation):
-    text = "Alexander Smith; Alex Smith"
-    spans = person_spans(text, "Alexander Smith", "Alex Smith")
-    records, warnings = PersonPipeline(
-        ScriptedGenerator(validate=lambda payload: relation)
-    ).link(text, spans)
-    assert records[spans[0].start].identifier != records[spans[1].start].identifier
-    assert warnings
-
-
-def test_invalid_assignment_to_unoffered_group_is_kept_separate_and_warns():
-    text = "Alexander Smith; Alex Smith"
-    spans = person_spans(text, "Alexander Smith", "Alex Smith")
-    records, warnings = PersonPipeline(
-        ScriptedGenerator(assign=lambda payload: "not-an-offered-group")
-    ).link(text, spans)
-    assert records[spans[0].start].identifier != records[spans[1].start].identifier
-    assert warnings
-
-
-def test_no_person_mentions_still_preflights_complete_input_and_makes_no_generation_calls():
-    text = "No names here."
-    phone_start = text.index("No")
-    non_person = Span(phone_start, phone_start + 2, "No", "PHONE", 0.99)
-    generator = ScriptedGenerator(preflight=17)
-
-    records, warnings = PersonPipeline(generator).link(text, [non_person])
-
-    assert records == {}
-    assert warnings == []
-    assert len(generator.preflight_calls) == 1
-    assert generator.preflight_calls[0][1] == {
-        "task": "person_grouping_preflight", "document": text, "mentions": [], "groups": [],
-    }
-    assert generator.calls == []
-
-
-def test_anonymize_text_preflights_even_when_detector_finds_no_person():
-    from pseudonymizer.service import anonymize_text
-
-    class NoPersonDetector:
-        def predict_entities(self, text, labels, threshold):
-            return []
-
-    text = "A document with no detected person names."
-    generator = ScriptedGenerator(preflight=23)
-    pipeline = PersonPipeline(generator)
-
-    masked, mapping = anonymize_text(text, NoPersonDetector(), pipeline)
-
-    assert masked == text
-    assert mapping == {}
-    assert len(generator.preflight_calls) == 1
-    assert generator.preflight_calls[0][1]["document"] == text
-    assert generator.calls == []
-
-
-def test_single_person_mention_still_preflights_and_gets_complete_assignment():
-    text = "Irene Blake"
-    spans = person_spans(text, "Irene Blake")
-    generator = ScriptedGenerator()
-
-    records, warnings = PersonPipeline(generator).link(text, spans)
-
-    assert len(generator.preflight_calls) == 1
-    assert generator.calls == []
-    assert set(records) == {spans[0].start}
-    assert records[spans[0].start].canonical == "Irene Blake"
-    assert warnings == []
-
-
-def test_context_preflight_error_aborts_before_any_assignment():
-    text = "Irene Blake"
-    spans = person_spans(text, "Irene Blake")
-    error = RuntimeError("context too large")
-    generator = ScriptedGenerator(preflight=error)
-
-    with pytest.raises(RuntimeError, match="context too large"):
-        PersonPipeline(generator).link(text, spans)
-    assert len(generator.preflight_calls) == 1
-    assert generator.calls == []
-
-
-def test_incremental_calls_scale_linearly_for_66_mentions():
+def test_each_anchor_call_is_bounded_by_mentions_and_uncertain_choices_remain_singletons():
     values = [f"Person{i} Surname{i}" for i in range(66)]
     text = "; ".join(values)
     spans = person_spans(text, *values)
@@ -314,15 +78,89 @@ def test_incremental_calls_scale_linearly_for_66_mentions():
 
     records, warnings = PersonPipeline(generator).link(text, spans)
 
-    assert len(generator.calls) <= 3 * (len(spans) - 1)
-    assert len(records) == len(spans)
-    assert len({record.identifier for record in records.values()}) == 1
     assert warnings == []
+    assert len(generator.calls) == len(spans) - 1
+    assert len(generator.calls) < len(spans)
+    assert len(records) == len(spans)
+    assert len({record.identifier for record in records.values()}) == len(spans)
+    payloads = [payload for _, payload in generator.calls]
+    assert [payload["anchor_id"] for payload in payloads] == [
+        f"m{index}" for index in range(1, len(spans))
+    ]
+    for index, payload in enumerate(payloads):
+        assert payload["allowed_same_person_ids"] == [
+            f"m{candidate}" for candidate in range(index + 2, len(spans) + 1)
+        ]
 
 
-def test_nonperson_spans_are_not_added_to_group_mention_table():
-    text = "Irene Blake; 0300 555 0100; 10 Oak Road"
-    spans = person_spans(text, "Irene Blake")
+def test_repeated_spellings_can_be_separate_and_name_similarity_does_not_override_model():
+    text = "John Smith; John Smith; Иван Иванович Петров; Иван Петрович Петров"
+    spans = person_spans(
+        text, "John Smith", "John Smith", "Иван Иванович Петров", "Иван Петрович Петров"
+    )
+    # First pair split; last two joined to the third source-order anchor.
+    generator = ScriptedGenerator(selections=[[], ["m4"], []])
+
+    records, warnings = PersonPipeline(generator).link(text, spans)
+
+    assert warnings == []
+    assert records[spans[0].start].identifier != records[spans[1].start].identifier
+    assert records[spans[2].start].identifier == records[spans[3].start].identifier
+    assert len(generator.calls) == 3
+
+
+@pytest.mark.parametrize("response", [
+    {},
+    {"same_person_ids": None},
+    {"same_person_ids": "m2"},
+    {"same_person_ids": ["m99"]},        # unknown or already-processed ID
+    {"same_person_ids": ["m1"]},         # anchor cannot be selected as its own candidate
+    {"same_person_ids": ["m2", "m2"]},   # duplicate ID
+    {"same_person_ids": [2]},
+    {"same_person_ids": [], "extra": 1}, # malformed exact schema
+])
+def test_bad_anchor_choice_raises_safe_grouping_error(response):
+    class BadGenerator(ScriptedGenerator):
+        def choose(self, system, payload):
+            self.calls.append((system, payload))
+            return response
+
+    text = "Alice Example; Bob Example; Casey Example"
+    spans = person_spans(text, "Alice Example", "Bob Example", "Casey Example")
+    generator = BadGenerator()
+
+    with pytest.raises(PersonGroupingError):
+        PersonPipeline(generator).link(text, spans)
+    assert len(generator.preflight_calls) == 1
+    assert len(generator.calls) == 1
+
+
+@pytest.mark.parametrize("person_values", [(), ("Irene Blake",)])
+def test_zero_or_one_person_preflights_complete_input_and_skips_generation(person_values):
+    text = "; ".join(person_values) if person_values else "No names here."
+    spans = person_spans(text, *person_values)
+    generator = ScriptedGenerator()
+
+    records, warnings = PersonPipeline(generator).link(text, spans)
+
+    assert warnings == []
+    assert len(generator.preflight_calls) == 1
+    assert generator.preflight_calls[0][1]["document"] == text
+    assert generator.preflight_calls[0][1]["mentions"] == [
+        {"id": f"m{index}", "value": span.value,
+         "start": span.start, "end": span.end}
+        for index, span in enumerate(spans, 1)
+    ]
+    assert generator.calls == []
+    if spans:
+        assert records[spans[0].start].canonical == spans[0].value
+    else:
+        assert records == {}
+
+
+def test_non_person_spans_are_excluded_from_grouping():
+    text = "Irene Blake; 0300 555 0100; 10 Oak Road; Alex Blake"
+    spans = person_spans(text, "Irene Blake", "Alex Blake")
     phone_start = text.index("0300 555 0100")
     address_start = text.index("10 Oak Road")
     spans.extend([
@@ -331,19 +169,36 @@ def test_nonperson_spans_are_not_added_to_group_mention_table():
     ])
     generator = ScriptedGenerator()
 
-    records, _ = PersonPipeline(generator).link(text, spans)
-
-    assert len(records) == 1
-    assert all(row["value"] == "Irene Blake"
-               for row in generator.preflight_calls[0][1]["mentions"])
-
-
-def test_preflight_input_is_not_truncated_by_pipeline():
-    text = "Irene Blake; " + ("контекст " * 1000)
-    spans = person_spans(text, "Irene Blake")
-    generator = ScriptedGenerator()
-
     PersonPipeline(generator).link(text, spans)
 
-    assert generator.preflight_calls[0][1]["document"] == text
-    assert len(generator.preflight_calls[0][1]["document"]) == len(text)
+    assert len(generator.calls) == 1
+    assert [row["value"] for row in generator.calls[0][1]["mentions"]] == [
+        "Irene Blake", "Alex Blake",
+    ]
+
+
+def test_longest_observed_value_is_canonical_and_equal_length_uses_earliest():
+    text = "Elisabeth Müller; Élisabeth Müller; Christopher Alexander de la Cruz"
+    spans = person_spans(
+        text, "Elisabeth Müller", "Élisabeth Müller", "Christopher Alexander de la Cruz"
+    )
+    # Keep first two together and third separate; then exercise longest selection separately.
+    generator = ScriptedGenerator(selections=[["m2"], []])
+    records, warnings = PersonPipeline(generator).link(text, spans)
+
+    assert warnings == []
+    assert records[spans[0].start].canonical == "Elisabeth Müller"
+    assert records[spans[1].start].canonical == "Elisabeth Müller"
+    assert records[spans[2].start].canonical == "Christopher Alexander de la Cruz"
+
+
+@pytest.mark.parametrize("person_values", [(), ("Irene Blake",)])
+def test_preflight_overflow_stops_before_generation_for_zero_or_one_person(person_values):
+    text = "; ".join(person_values) if person_values else "No names here."
+    spans = person_spans(text, *person_values)
+    generator = ScriptedGenerator(preflight_error=RuntimeError("context too large"))
+
+    with pytest.raises(RuntimeError, match="context too large"):
+        PersonPipeline(generator).link(text, spans)
+    assert len(generator.preflight_calls) == 1
+    assert generator.calls == []

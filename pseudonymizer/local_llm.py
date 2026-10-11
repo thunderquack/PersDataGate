@@ -53,6 +53,10 @@ class ContextLimitError(GenerationError):
         )
 
 
+class PersonGroupingError(GenerationError):
+    """The local model returned an invalid person-link response."""
+
+
 def _finite_choices(payload: Any) -> list[dict[str, Any]] | None:
     """Return the only permitted JSON outputs for production choice payloads."""
     if not isinstance(payload, dict):
@@ -119,6 +123,16 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _output_budget(payload: Any) -> int:
+    """Reserve dynamic completion space for the anchor's candidate ID list."""
+    if isinstance(payload, dict) and payload.get("task") == "link_person_mentions":
+        allowed = payload.get("allowed_same_person_ids")
+        if not isinstance(allowed, list) or any(not isinstance(item, str) for item in allowed):
+            raise GenerationError("link_person_mentions requires allowed_same_person_ids")
+        return max(MAX_NEW_TOKENS, 16 * len(allowed) + 64)
+    return MAX_NEW_TOKENS
+
+
 class QwenGenerator:
     """Generate one strict JSON object with a pinned local Qwen model."""
 
@@ -171,11 +185,14 @@ class QwenGenerator:
 
     def _prepare_input(self, system: str, payload: Any):
         """Render and encode the exact input used by both preflight and generation."""
+        output_budget = _output_budget(payload)
+        maximum_input_tokens = max(0, self.context_window - output_budget)
         self._event("llm.input", {
             "system": system,
             "payload": payload,
             "context_window": self.context_window,
-            "input_budget": self.input_budget,
+            "input_budget": maximum_input_tokens,
+                "max_new_tokens": output_budget,
         })
         if not isinstance(system, str):
             raise GenerationError("Model instructions must be text")
@@ -184,7 +201,7 @@ class QwenGenerator:
         except (TypeError, ValueError) as exc:
             self._event("llm.error", {"type": type(exc).__name__, "phase": "serialize_payload",
                                  "context_window": self.context_window,
-                                 "input_budget": self.input_budget})
+                                 "input_budget": maximum_input_tokens})
             raise GenerationError("Model input must be JSON-serializable") from exc
 
         messages = [
@@ -210,12 +227,13 @@ class QwenGenerator:
             self._event("llm.error", {"type": type(exc).__name__, "phase": "render_prompt",
                                  "system": system, "payload": payload,
                                  "context_window": self.context_window,
-                                 "input_budget": self.input_budget})
+                                 "input_budget": maximum_input_tokens})
             raise GenerationError("Could not render model input") from exc
         self._event("llm.input", {
             "rendered_prompt": rendered,
             "context_window": self.context_window,
-            "input_budget": self.input_budget,
+            "input_budget": maximum_input_tokens,
+            "max_new_tokens": output_budget,
         })
         try:
             encoded = self.tokenizer(rendered, return_tensors="pt", add_special_tokens=False)
@@ -224,7 +242,7 @@ class QwenGenerator:
             self._event("llm.error", {"type": type(exc).__name__, "phase": "encode_input",
                                  "rendered_prompt": rendered,
                                  "context_window": self.context_window,
-                                 "input_budget": self.input_budget})
+                                 "input_budget": maximum_input_tokens})
             raise GenerationError("Could not encode model input") from exc
 
         input_tokens = int(input_ids.shape[-1])
@@ -232,34 +250,37 @@ class QwenGenerator:
             "rendered_prompt": rendered,
             "input_tokens": input_tokens,
             "context_window": self.context_window,
-            "input_budget": self.input_budget,
+            "input_budget": maximum_input_tokens,
+            "max_new_tokens": output_budget,
         })
-        if input_tokens > self.input_budget:
+        if input_tokens > maximum_input_tokens:
             self._event("llm.error", {
                 "type": "ContextLimitError",
                 "phase": "input_limit",
                 "input_tokens": input_tokens,
-                "maximum_input_tokens": self.input_budget,
+                "maximum_input_tokens": maximum_input_tokens,
                 "context_window": self.context_window,
-                "input_budget": self.input_budget,
+                "input_budget": maximum_input_tokens,
+            "max_new_tokens": output_budget,
                 "rendered_prompt": rendered,
             })
-            raise ContextLimitError(input_tokens, self.input_budget, self.context_window)
-        return rendered, encoded, input_tokens
+            raise ContextLimitError(input_tokens, maximum_input_tokens, self.context_window)
+        return rendered, encoded, input_tokens, output_budget
 
     def check_input(self, system: str, payload: Any) -> int:
         """Validate a full prompt against the exact model input budget without generation."""
-        _, _, input_tokens = self._prepare_input(system, payload)
+        _, _, input_tokens, output_budget = self._prepare_input(system, payload)
         self._event("llm.preflight", {
             "input_tokens": input_tokens,
             "context_window": self.context_window,
-            "input_budget": self.input_budget,
+            "input_budget": self.context_window - output_budget,
+            "max_new_tokens": output_budget,
         })
         return input_tokens
 
     def choose(self, system: str, payload: Any) -> dict[str, Any]:
         """Return a parsed JSON object; never accept prose or invented names."""
-        rendered, encoded, input_tokens = self._prepare_input(system, payload)
+        rendered, encoded, input_tokens, output_budget = self._prepare_input(system, payload)
 
         model_inputs = {key: value.to(self.device) for key, value in encoded.items()}
         try:
@@ -276,7 +297,7 @@ class QwenGenerator:
             with _GENERATION_LOCK, self._torch.inference_mode():
                 output = self.model.generate(
                     **model_inputs,
-                    max_new_tokens=MAX_NEW_TOKENS,
+                    max_new_tokens=output_budget,
                     do_sample=False,
                     logits_to_keep=1,
                     **generation_options,

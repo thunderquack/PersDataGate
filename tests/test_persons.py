@@ -42,19 +42,41 @@ def expected_annotated_document(text, spans):
     rows = []
     source_cursor = 0
     shift = 0
-    for index, span in enumerate(spans, 1):
-        mention_id = f"m{index}"
+    rows_by_value = {}
+    for span in spans:
+        normalization_key = span.value.strip().casefold()
+        row = rows_by_value.get(normalization_key)
+        if row is None:
+            mention_id = f"m{len(rows) + 1}"
+            row = {
+                "id": mention_id,
+                "value": span.value,
+                "observed_values": [span.value],
+                "start": None,
+                "end": None,
+                "source_start": None,
+                "source_end": None,
+                "occurrences": [],
+            }
+            rows_by_value[normalization_key] = row
+            rows.append(row)
+        else:
+            mention_id = row["id"]
+            if span.value not in row["observed_values"]:
+                row["observed_values"].append(span.value)
         tag = f"⟦{mention_id}⟧ "
         parts.extend((text[source_cursor:span.start], tag, span.value))
         annotated_start = span.start + shift + len(tag)
-        rows.append({
-            "id": mention_id,
+        occurrence = {
             "value": span.value,
             "start": annotated_start,
             "end": annotated_start + len(span.value),
             "source_start": span.start,
             "source_end": span.end,
-        })
+        }
+        row["occurrences"].append(occurrence)
+        if row["start"] is None:
+            row.update(occurrence)
         shift += len(tag)
         source_cursor = span.end
     parts.append(text[source_cursor:])
@@ -110,26 +132,104 @@ def test_anchor_grouping_uses_source_order_full_document_offsets_and_only_unassi
 def test_inline_ids_bind_repeated_adjacent_unicode_occurrences_without_changing_source_offsets():
     text = "ÉvaÉva"
     spans = person_spans(text, "Éva", "Éva")
+    generator = ScriptedGenerator()
+
+    records, warnings = PersonPipeline(generator).link(text, spans)
+
+    assert warnings == []
+    assert generator.calls == []
+    payload = generator.preflight_calls[0][1]
+    assert payload["document"] == "⟦m1⟧ Éva⟦m1⟧ Éva"
+    assert payload["mentions"] == [
+        {"id": "m1", "value": "Éva", "start": 5, "end": 8,
+         "source_start": 0, "source_end": 3, "occurrences": [
+             {"start": 5, "end": 8, "source_start": 0, "source_end": 3},
+             {"start": 13, "end": 16, "source_start": 3, "source_end": 6},
+         ]},
+    ]
+    row = payload["mentions"][0]
+    assert [payload["document"][occ["start"]:occ["end"]]
+            for occ in row["occurrences"]] == ["Éva", "Éva"]
+    assert [text[occ["source_start"]:occ["source_end"]]
+            for occ in row["occurrences"]] == ["Éva", "Éva"]
+    assert records[0].identifier == records[3].identifier
+
+
+def test_exact_raw_repeats_share_an_id_before_model_and_keep_every_source_start():
+    text = "John Smith; John Smith"
+    spans = person_spans(text, "John Smith", "John Smith")
+    generator = ScriptedGenerator()
+
+    records, warnings = PersonPipeline(generator).link(text, spans)
+
+    assert warnings == []
+    assert generator.calls == []  # one unique raw value needs no model choice
+    payload = generator.preflight_calls[0][1]
+    assert payload["document"] == "⟦m1⟧ John Smith; ⟦m1⟧ John Smith"
+    assert payload["mentions"] == [{
+        "id": "m1", "value": "John Smith", "start": 5, "end": 15,
+        "source_start": 0, "source_end": 10,
+        "occurrences": [
+            {"start": 5, "end": 15, "source_start": 0, "source_end": 10},
+            {"start": 22, "end": 32, "source_start": 12, "source_end": 22},
+        ],
+    }]
+    assert set(records) == {0, 12}
+    assert records[0].identifier == records[12].identifier
+
+
+def test_trim_and_unicode_casefold_pregroup_but_internal_space_nfc_and_initials_stay_distinct():
+    values = [
+        " ÄNNA ", "änna",                    # trim + Unicode casefold
+        "Straße", "STRASSE",                 # German sharp-s casefold expansion
+        " ИВАН ", "иван",                    # Cyrillic casefold
+        "A  B", "A B",                       # internal whitespace preserved
+        "é", "e\u0301",                      # no Unicode normalization
+        "J. Smith", "John Smith",            # no initials or linguistic heuristic
+    ]
+    text = "; ".join(values)
+    spans = person_spans(text, *values)
+    generator = ScriptedGenerator(selections=[[], [], [], [], [], [], [], []])
+
+    records, warnings = PersonPipeline(generator).link(text, spans)
+
+    assert warnings == []
+    assert len(generator.calls) == 8
+    payload = generator.calls[0][1]
+    assert [row["value"] for row in payload["mentions"]] == [
+        " ÄNNA ", "Straße", " ИВАН ", "A  B", "A B", "é", "e\u0301", "J. Smith", "John Smith",
+    ]
+    assert [row["id"] for row in payload["mentions"]] == [f"m{i}" for i in range(1, 10)]
+    assert len({records[spans[index].start].identifier for index in (0, 1)}) == 1
+    assert len({records[spans[index].start].identifier for index in (2, 3)}) == 1
+    assert len({records[spans[index].start].identifier for index in (4, 5)}) == 1
+    assert records[spans[6].start].identifier != records[spans[7].start].identifier
+    assert records[spans[8].start].identifier != records[spans[9].start].identifier
+    assert records[spans[10].start].identifier != records[spans[11].start].identifier
+    assert payload["mentions"][0]["observed_values"] == [" ÄNNA ", "änna"]
+    assert payload["mentions"][1]["observed_values"] == ["Straße", "STRASSE"]
+    assert payload["mentions"][2]["observed_values"] == [" ИВАН ", "иван"]
+
+
+def test_model_selection_of_one_unique_id_maps_all_of_its_exact_occurrences():
+    text = "John Smith; John Smith; Johnny Smith"
+    spans = person_spans(text, "John Smith", "John Smith", "Johnny Smith")
     generator = ScriptedGenerator(selections=[["m2"]])
 
     records, warnings = PersonPipeline(generator).link(text, spans)
 
     assert warnings == []
-    _, payload = generator.calls[0]
-    assert payload["document"] == "⟦m1⟧ Éva⟦m2⟧ Éva"
-    assert payload["mentions"] == [
-        {"id": "m1", "value": "Éva", "start": 5, "end": 8,
-         "source_start": 0, "source_end": 3},
-        {"id": "m2", "value": "Éva", "start": 13, "end": 16,
-         "source_start": 3, "source_end": 6},
+    assert len(generator.calls) == 1
+    payload = generator.calls[0][1]
+    assert [row["id"] for row in payload["mentions"]] == ["m1", "m2"]
+    assert payload["allowed_same_person_ids"] == ["m2"]
+    assert payload["remaining_candidates"] == [payload["mentions"][1]]
+    assert payload["mentions"][0]["occurrences"] == [
+        {"start": 5, "end": 15, "source_start": 0, "source_end": 10},
+        {"start": 22, "end": 32, "source_start": 12, "source_end": 22},
     ]
-    assert [payload["document"][row["start"]:row["end"]] for row in payload["mentions"]] == [
-        "Éva", "Éva",
-    ]
-    assert [text[row["source_start"]:row["source_end"]] for row in payload["mentions"]] == [
-        "Éva", "Éva",
-    ]
-    assert records[0].identifier == records[3].identifier
+    assert set(records) == {0, 12, 24}
+    assert len({record.identifier for record in records.values()}) == 1
 
 
 def test_each_anchor_call_is_bounded_by_mentions_and_uncertain_choices_remain_singletons():

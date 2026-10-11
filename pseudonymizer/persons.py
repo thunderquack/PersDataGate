@@ -26,7 +26,10 @@ class PersonRecord:
 _SYSTEM_LINK = (
     "For the anchor person mention, identify which of the allowed remaining mentions "
     "refer to the same individual. In document, ⟦mN⟧ tags are model-only annotations "
-    "placed immediately before each exact PERSON occurrence; they are not source text "
+    "placed immediately before each PERSON occurrence; occurrences with the same key "
+    "after trimming edge whitespace and Unicode casefold share one ID and tag. This "
+    "preserves internal whitespace and does not perform Unicode NFC normalization. "
+    "Tags are not source text "
     "and must never be treated as part of a name. Mention start/end are offsets in this "
     "annotated document; source_start/source_end are offsets in the original unannotated "
     "document. Mention values remain exact source strings. Find ALL allowed matches supported by context, "
@@ -55,12 +58,33 @@ class PersonPipeline:
             (span for span in spans if getattr(span, "code", None) == "PERSON"),
             key=lambda item: (item.start, item.end),
         )
-        mention_rows = [
-            {"id": f"m{index + 1}", "value": span.value,
-             "start": span.start, "end": span.end,
-             "source_start": span.start, "source_end": span.end}
-            for index, span in enumerate(mentions)
-        ]
+        rows_by_value: dict[str, dict[str, Any]] = {}
+        mention_rows: list[dict[str, Any]] = []
+        for span in mentions:
+            grouping_key = span.value.strip().casefold()
+            row = rows_by_value.get(grouping_key)
+            if row is None:
+                row = {
+                    "id": f"m{len(mention_rows) + 1}",
+                    "value": span.value,
+                    "start": span.start,
+                    "end": span.end,
+                    "source_start": span.start,
+                    "source_end": span.end,
+                    "observed_values": [],
+                    "occurrences": [],
+                }
+                rows_by_value[grouping_key] = row
+                mention_rows.append(row)
+            if span.value not in row["observed_values"]:
+                row["observed_values"].append(span.value)
+            row["occurrences"].append({
+                "value": span.value,
+                "start": span.start,
+                "end": span.end,
+                "source_start": span.start,
+                "source_end": span.end,
+            })
         annotated_document = self._annotate_document(text, mention_rows)
         rows_by_id = {row["id"]: row for row in mention_rows}
         pending = [row["id"] for row in mention_rows]
@@ -99,6 +123,8 @@ class PersonPipeline:
                 preflight_tokens = checker(_SYSTEM_LINK, preflight_payload)
             event("person.group_input", {
                 "mentions": mention_rows,
+                "occurrence_count": len(mentions),
+                "unique_mention_count": len(mention_rows),
                 "preflight_tokens": preflight_tokens,
             })
 
@@ -147,18 +173,25 @@ class PersonPipeline:
             logged_groups: list[dict[str, Any]] = []
             for group_index, group_ids in enumerate(groups, start=1):
                 group_rows = [rows_by_id[mention_id] for mention_id in group_ids]
-                canonical = max((row["value"] for row in group_rows), key=len)
+                source_occurrences = sorted(
+                    (occurrence for row in group_rows for occurrence in row["occurrences"]),
+                    key=lambda occurrence: occurrence["source_start"],
+                )
+                observed_values = [occurrence["value"] for occurrence in source_occurrences]
+                canonical = max(observed_values, key=len)
                 record = PersonRecord(
                     identifier=f"person_{uuid.uuid4().hex}",
                     canonical=canonical,
-                    aliases=tuple(dict.fromkeys(row["value"] for row in group_rows)),
+                    aliases=tuple(dict.fromkeys(observed_values)),
                 )
                 for row in group_rows:
-                    records_by_start[row["source_start"]] = record
+                    for occurrence in row["occurrences"]:
+                        records_by_start[occurrence["source_start"]] = record
                 logged_groups.append({
                     "group_id": f"entity_{group_index}",
                     "mention_ids": group_ids,
                     "mentions": group_rows,
+                    "source_occurrences": source_occurrences,
                     "canonical": record.canonical,
                     "aliases": list(record.aliases),
                     "identifier": record.identifier,
@@ -169,7 +202,8 @@ class PersonPipeline:
         finally:
             event("person.group_summary", {
                 "status": status,
-                "mention_count": len(mention_rows),
+                "occurrence_count": len(mentions),
+                "unique_mention_count": len(mention_rows),
                 "generation_calls": generation_calls,
                 "preflight_tokens": preflight_tokens,
                 "group_count": len(groups) if status == "ok" else None,
@@ -178,35 +212,42 @@ class PersonPipeline:
 
     @staticmethod
     def _annotate_document(text: str, mention_rows: list[dict[str, Any]]) -> str:
-        insertions: dict[int, list[str]] = {}
+        insertions: dict[int, list[tuple[str, dict[str, Any]]]] = {}
         rows_by_id = {row["id"]: row for row in mention_rows}
         for row in mention_rows:
-            start, end = row["source_start"], row["source_end"]
-            if (not isinstance(start, int) or not isinstance(end, int)
-                    or start < 0 or end < start or end > len(text)
-                    or text[start:end] != row["value"]):
-                raise PersonGroupingError("A PERSON mention offset does not match the source text")
-            insertions.setdefault(start, []).append(row["id"])
+            for occurrence in row["occurrences"]:
+                start, end = occurrence["source_start"], occurrence["source_end"]
+                if (not isinstance(start, int) or not isinstance(end, int)
+                        or start < 0 or end < start or end > len(text)
+                        or text[start:end] != occurrence["value"]):
+                    raise PersonGroupingError("A PERSON mention offset does not match the source text")
+                insertions.setdefault(start, []).append((row["id"], occurrence))
 
         offset_shift = 0
         for source_start in sorted(insertions):
-            ids = insertions[source_start]
-            offset_shift += sum(len(f"⟦{mention_id}⟧ ") for mention_id in ids)
+            annotations = insertions[source_start]
+            offset_shift += sum(len(f"⟦{mention_id}⟧ ") for mention_id, _ in annotations)
             annotated_start = source_start + offset_shift
-            for mention_id in ids:
+            for mention_id, occurrence in annotations:
+                occurrence["start"] = annotated_start
+                occurrence["end"] = annotated_start + len(occurrence["value"])
                 row = rows_by_id[mention_id]
-                row["start"] = annotated_start
-                row["end"] = annotated_start + len(row["value"])
+                if occurrence is row["occurrences"][0]:
+                    row["start"] = annotated_start
+                    row["end"] = annotated_start + len(occurrence["value"])
 
         parts: list[str] = []
         cursor = 0
         for start in sorted(insertions):
             parts.append(text[cursor:start])
-            parts.extend(f"⟦{mention_id}⟧ " for mention_id in insertions[start])
+            parts.extend(f"⟦{mention_id}⟧ " for mention_id, _ in insertions[start])
             cursor = start
         parts.append(text[cursor:])
         annotated = "".join(parts)
-        if any(annotated[row["start"]:row["end"]] != row["value"] for row in mention_rows):
+        if any(
+            annotated[occurrence["start"]:occurrence["end"]] != occurrence["value"]
+            for row in mention_rows for occurrence in row["occurrences"]
+        ):
             raise PersonGroupingError("Overlapping PERSON spans cannot be annotated unambiguously")
         return annotated
 
